@@ -66,6 +66,35 @@ class TestSchema(DBTestCase):
         self.assertEqual(self.conn.execute("SELECT count(*) FROM shots").fetchone()[0], 0)
 
 
+class TestMigration(DBTestCase):
+    def test_upgrades_a_v1_database_in_place(self):
+        """A v1 DB predates the delivery columns; init_db must add them, not fail."""
+        path = Path(self._dir.name) / "old.db"
+        old = db.connect(path)
+        schema = db.SCHEMA_PATH.read_text()
+        for column in ("zernio_post_id", "delivery_status", "delivery_checked_at"):
+            schema = "\n".join(
+                line for line in schema.splitlines() if not line.strip().startswith(column)
+            )
+        old.executescript(schema)
+        old.execute("PRAGMA user_version = 1")
+        source_id = db.upsert_source(
+            old, path="/archive/x.mp4", relpath="x.mp4", size_bytes=1, mtime=1.0
+        )
+        db.replace_shots(old, source_id, [(0.0, 5.0)])
+        old.commit()
+        old.close()
+
+        upgraded = db.init_db(path)
+        self.addCleanup(upgraded.close)
+        self.assertEqual(
+            upgraded.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION
+        )
+        row = upgraded.execute("SELECT * FROM shots").fetchone()
+        self.assertIsNone(row["delivery_status"])
+        self.assertEqual(row["in_point"], 0.0)  # existing data survives
+
+
 class TestIngestWrites(DBTestCase):
     def test_upsert_source_is_idempotent_on_path(self):
         first = self.make_source()

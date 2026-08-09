@@ -52,9 +52,12 @@ class Config:
     overlay_font: str | None = os.environ.get("OVERLAY_FONT") or None
     licensing_codec: str = os.environ.get("LICENSING_CODEC", "libx264")
 
-    # Stage 5
-    zernio_base_url: str = os.environ.get("ZERNIO_BASE_URL", "https://api.zernio.com")
-    zernio_token: str | None = os.environ.get("ZERNIO_TOKEN") or None
+    # Stage 5 — Zernio credentials are read by pipeline/zernio.py from
+    # ZERNIO_API_KEY / ZERNIO_BASE_URL / ZERNIO_PROFILE_ID, matching the names
+    # the new-visu app already uses so one .env serves both.
+    social_platforms: tuple[str, ...] = tuple(
+        p.strip() for p in os.environ.get("SOCIAL_PLATFORMS", "instagram,tiktok").split(",") if p.strip()
+    )
 
     @property
     def social_render_dir(self) -> Path:

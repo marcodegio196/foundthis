@@ -95,9 +95,17 @@ CREATE TABLE IF NOT EXISTS shots (
     -- Stage 5 — distribute & learn
     -- ---------------------------------------------------------------------
     caption           TEXT,
-    platform_ids      TEXT,                      -- JSON object: {platform: post_id}
+    zernio_post_id    TEXT,                      -- the `post._id` Zernio returns
+    platform_ids      TEXT,                      -- JSON object: {platform: account_id}
     posted_at         TEXT,
     licensed_to       TEXT,                      -- JSON array of marketplace uploads
+
+    -- Delivery status is what Zernio reports (queued/published/failed per
+    -- platform). Performance metrics are a different thing from a different
+    -- source; keeping them apart stops "it posted" being mistaken for "it did
+    -- well" when stage 4 starts reweighting on this data.
+    delivery_status   TEXT,                      -- JSON: {platform: status}
+    delivery_checked_at TEXT,
     metrics           TEXT,                      -- JSON object of latest pulled metrics
     metrics_updated_at TEXT,
 

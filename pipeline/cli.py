@@ -158,9 +158,14 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
     conn = _open(args)
     try:
-        if args.metrics_only:
-            return _report("metrics", distribute.refresh_metrics(conn, config))
-        return _report("publish", distribute.run(conn, config, limit=args.limit))
+        if args.sync_only:
+            return _report("sync", distribute.sync_delivery(conn, config))
+        return _report(
+            "publish",
+            distribute.run(
+                conn, config, limit=args.limit, platforms=config.social_platforms
+            ),
+        )
     finally:
         conn.close()
 
@@ -221,9 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render.set_defaults(func=cmd_render)
 
-    publish = sub.add_parser("publish", help="stage 5: post via Zernio and pull metrics")
+    publish = sub.add_parser("publish", help="stage 5: post via Zernio, then check delivery")
     publish.add_argument("--limit", type=int)
-    publish.add_argument("--metrics-only", action="store_true")
+    publish.add_argument(
+        "--sync-only", action="store_true",
+        help="re-check delivery status of already-posted shots, publish nothing",
+    )
     publish.set_defaults(func=cmd_publish)
 
     return parser

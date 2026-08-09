@@ -1,29 +1,34 @@
-"""Stage 5 — publish rendered clips and feed results back into selection.
+"""Stage 5 — publish rendered clips and track what happened to them.
 
-The Zernio client here is an adapter written against the shape its API is
-expected to have (bearer token, POST a post, GET metrics by post id). The
-endpoint paths are configuration, not constants, so pointing it at the real API
-is an env change rather than a rewrite — and `DryRunClient` lets the rest of
-the stage be exercised end to end before any of that is settled.
+The Zernio protocol lives in `pipeline/zernio.py`, ported from the working
+integration in the `new-visu` repo. This module is the pipeline half: which
+shots are ready, what the caption says, and what gets written back.
 
-Licensing upload stays deliberately manual: uploading a master to a marketplace
-is not worth automating until one proves it converts.
+One correction worth stating plainly: Zernio reports **delivery status**
+(queued / published / failed, per platform), not performance. The feedback loop
+that reweights Stage 4 selection needs view and engagement counts, which come
+from somewhere else — so those land in `metrics`, and delivery status lands in
+`delivery_status`, and the two are never conflated.
+
+Licensing upload stays manual: it isn't worth automating until a marketplace
+proves it converts.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
-import urllib.error
-import urllib.request
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from .. import db
 from ..config import Config, config as default_config
+from ..zernio import ZernioClient, ZernioError, summarise_delivery
 
 log = logging.getLogger(__name__)
+
+# Vertical renders suit reels and TikTok; Facebook is left out unless asked for.
+DEFAULT_PLATFORMS = ("instagram", "tiktok")
 
 
 def build_caption(row: db.Row, cfg: Config = default_config) -> str:
@@ -43,96 +48,36 @@ def build_caption(row: db.Row, cfg: Config = default_config) -> str:
 
 
 class PublishClient(Protocol):
-    def publish(self, video_path: Path, caption: str) -> dict[str, str]:
-        """Publish a clip; return {platform: post_id}."""
+    def publish(
+        self, video_path: Path, caption: str, *, platforms: Sequence[str] | None = None
+    ) -> dict[str, Any]:
+        """Publish a clip; return the Zernio response."""
 
-    def metrics(self, platform_ids: dict[str, str]) -> dict[str, Any]:
-        """Fetch current performance metrics for previously published posts."""
+    def fetch_post(self, post_id: str) -> dict[str, Any] | None:
+        """Fetch a published post's current state."""
 
 
 class DryRunClient:
-    """Records what would be published. The default until a token is set."""
+    """Records what would be published. The default until an API key is set."""
 
     def __init__(self) -> None:
         self.published: list[tuple[Path, str]] = []
 
-    def publish(self, video_path: Path, caption: str) -> dict[str, str]:
-        self.published.append((video_path, caption))
-        log.info("[dry run] would publish %s", video_path)
+    def publish(self, video_path, caption, *, platforms=None):
+        self.published.append((Path(video_path), caption))
+        log.info("[dry run] would publish %s to %s", video_path, platforms or "all")
         return {}
 
-    def metrics(self, platform_ids: dict[str, str]) -> dict[str, Any]:
-        return {}
-
-
-class ZernioClient:
-    """Minimal HTTP adapter — stdlib only, so Stage 5 adds no dependency."""
-
-    def __init__(self, base_url: str, token: str, timeout: float = 60.0):
-        self.base_url = base_url.rstrip("/")
-        self.token = token
-        self.timeout = timeout
-
-    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
-        body = json.dumps(payload).encode() if payload is not None else None
-        request = urllib.request.Request(
-            f"{self.base_url}{path}",
-            data=body,
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read() or b"null")
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"zernio {method} {path} failed: {exc.code} {exc.read()[:200]!r}"
-            ) from exc
-
-    def publish(self, video_path: Path, caption: str) -> dict[str, str]:
-        # The upload itself is a separate call from the post so a failed publish
-        # doesn't mean re-uploading a 40MB file.
-        media_id = self._request(
-            "POST", "/v1/media", {"filename": video_path.name}
-        )["id"]
-        self._upload(media_id, video_path)
-        result = self._request(
-            "POST", "/v1/posts", {"media_id": media_id, "caption": caption}
-        )
-        return {p["platform"]: p["id"] for p in result.get("platforms", [])}
-
-    def _upload(self, media_id: str, video_path: Path) -> None:
-        request = urllib.request.Request(
-            f"{self.base_url}/v1/media/{media_id}/content",
-            data=video_path.read_bytes(),
-            method="PUT",
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "video/mp4",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout):
-            pass
-
-    def metrics(self, platform_ids: dict[str, str]) -> dict[str, Any]:
-        collected: dict[str, Any] = {}
-        for platform, post_id in platform_ids.items():
-            try:
-                collected[platform] = self._request("GET", f"/v1/posts/{post_id}/metrics")
-            except RuntimeError as exc:
-                log.warning("metrics fetch failed for %s/%s: %s", platform, post_id, exc)
-        return collected
+    def fetch_post(self, post_id: str):
+        return None
 
 
 def build_client(cfg: Config = default_config) -> PublishClient:
-    if not cfg.zernio_token:
-        log.warning("ZERNIO_TOKEN unset — running in dry-run mode")
+    try:
+        return ZernioClient()
+    except ZernioError as exc:
+        log.warning("%s — running in dry-run mode", exc)
         return DryRunClient()
-    return ZernioClient(cfg.zernio_base_url, cfg.zernio_token)
 
 
 def publish_pending(
@@ -140,6 +85,7 @@ def publish_pending(
     cfg: Config = default_config,
     *,
     limit: int | None = None,
+    platforms: Sequence[str] = DEFAULT_PLATFORMS,
     client: PublishClient | None = None,
 ) -> dict[str, int]:
     """Post every rendered, approved, un-posted shot."""
@@ -155,15 +101,20 @@ def publish_pending(
     for row in rows:
         caption = build_caption(row, cfg)
         try:
-            platform_ids = client.publish(Path(row["social_render_path"]), caption)
+            response = client.publish(
+                Path(row["social_render_path"]), caption, platforms=platforms
+            )
         except Exception as exc:
             log.warning("publish failed for shot %s: %s", row["id"], exc)
             counts["failed"] += 1
             continue
 
-        # A dry run produces no platform ids; leaving posted_at unset keeps the
-        # shot in the queue rather than silently marking it published.
-        if not platform_ids:
+        post = response.get("post") if isinstance(response, dict) else None
+        zernio_post_id = (post or {}).get("_id") if isinstance(post, dict) else None
+
+        # A dry run returns nothing; leaving posted_at unset keeps the shot in
+        # the queue rather than silently marking it published.
+        if not zernio_post_id:
             continue
 
         with db.transaction(conn):
@@ -171,47 +122,55 @@ def publish_pending(
                 conn,
                 row["id"],
                 caption=caption,
-                platform_ids=platform_ids,
+                zernio_post_id=str(zernio_post_id),
+                platform_ids={
+                    p["platform"]: p.get("accountId", "")
+                    for p in (post.get("platforms") or [])
+                    if isinstance(p, dict) and p.get("platform")
+                },
+                delivery_status=summarise_delivery(post),
+                delivery_checked_at=db.now(),
                 posted_at=db.now(),
             )
         counts["posted"] += 1
-        log.info("shot %s posted to %s", row["id"], ", ".join(platform_ids))
+        log.info("shot %s posted as %s", row["id"], zernio_post_id)
 
     return counts
 
 
-def refresh_metrics(
+def sync_delivery(
     conn: sqlite3.Connection,
     cfg: Config = default_config,
     *,
     client: PublishClient | None = None,
 ) -> dict[str, int]:
-    """Pull performance metrics for posted shots and store them on the row.
+    """Re-check what Zernio did with each posted shot.
 
-    This is what eventually reweights Stage 4 selection — which moods and
-    countries actually perform — so it is worth running long before there is
-    enough volume to draw conclusions from.
+    A post accepted by the API can still fail at the platform minutes later,
+    so "posted" is not the end of the story — this is what turns a silent
+    Instagram rejection into something visible in `stats`.
     """
     client = client if client is not None else build_client(cfg)
     rows = conn.execute(
-        "SELECT * FROM shots WHERE posted_at IS NOT NULL AND platform_ids IS NOT NULL"
+        "SELECT id, zernio_post_id FROM shots WHERE zernio_post_id IS NOT NULL"
     ).fetchall()
 
-    counts = {"updated": 0, "failed": 0}
+    counts = {"checked": 0, "failed_delivery": 0}
     for row in rows:
-        try:
-            metrics = client.metrics(row["platform_ids"])
-        except Exception as exc:
-            log.warning("metrics failed for shot %s: %s", row["id"], exc)
-            counts["failed"] += 1
+        post = client.fetch_post(row["zernio_post_id"])
+        if not post:
             continue
-        if not metrics:
-            continue
+        statuses = summarise_delivery(post)
         with db.transaction(conn):
             db.update_shot(
-                conn, row["id"], metrics=metrics, metrics_updated_at=db.now()
+                conn, row["id"],
+                delivery_status=statuses,
+                delivery_checked_at=db.now(),
             )
-        counts["updated"] += 1
+        counts["checked"] += 1
+        if any(s.startswith(("failed", "error")) for s in statuses.values()):
+            counts["failed_delivery"] += 1
+            log.warning("shot %s delivery problem: %s", row["id"], statuses)
 
     return counts
 
@@ -221,8 +180,11 @@ def run(
     cfg: Config = default_config,
     *,
     limit: int | None = None,
+    platforms: Sequence[str] = DEFAULT_PLATFORMS,
     client: PublishClient | None = None,
 ) -> dict[str, int]:
     client = client if client is not None else build_client(cfg)
-    published = publish_pending(conn, cfg, limit=limit, client=client)
-    return {**published, **refresh_metrics(conn, cfg, client=client)}
+    published = publish_pending(
+        conn, cfg, limit=limit, platforms=platforms, client=client
+    )
+    return {**published, **sync_delivery(conn, cfg, client=client)}

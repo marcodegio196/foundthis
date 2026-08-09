@@ -61,7 +61,20 @@ archive or a small test folder:
 export ARCHIVE_ROOT=/Volumes/drone/archive   # expects archive/<country>/<file>
 export PIPELINE_DB=./pipeline.db
 export RENDER_ROOT=./renders
+
+# Stage 3
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Stage 5 — same variable names the new-visu app uses, so one .env serves both
+export ZERNIO_API_KEY=sk_...                 # sk_ + 64 hex
+export ZERNIO_BASE_URL=https://zernio.com/api/v1
+export ZERNIO_PROFILE_ID=...                 # optional
+export SOCIAL_PLATFORMS=instagram,tiktok
 ```
+
+Accounts are connected through Zernio's OAuth redirect (`GET /connect/{platform}`),
+which is an interactive browser flow — do it in the new-visu web app. This
+pipeline only reads accounts that are already connected.
 
 Stage 2+ needs `requirements.txt` installed plus `ffmpeg`/`ffprobe` on `PATH`.
 The database layer and CLI deliberately need neither.
@@ -74,7 +87,25 @@ The database layer and CLI deliberately need neither.
 | 2 — score & filter | Built. Aesthetic component needs `AESTHETIC_WEIGHTS`; without it the run uses motion and technical quality alone |
 | 3 — tag & describe | Built. Needs `ANTHROPIC_API_KEY` |
 | 4 — select & render | Built. Approval is a manual step until the format is validated |
-| 5 — distribute & learn | Built against the expected Zernio API shape — **endpoint paths unverified**, dry-run until `ZERNIO_TOKEN` is set |
+| 5 — distribute & learn | Built. Zernio client ported from the working integration in `new-visu`, dry-run until `ZERNIO_API_KEY` is set. Delivery status works; **performance metrics have no source yet** — see below |
+
+## Delivery status is not performance
+
+Zernio's API covers `accounts`, `connect`, `posts`, `media/presign`, `logs`, and
+`inbox` — it reports **whether a post was delivered** (queued / published /
+failed, per platform), not how it performed. Those are stored separately:
+
+| Column | Source | State |
+|---|---|---|
+| `delivery_status`, `delivery_checked_at` | Zernio `GET /posts/{id}` | Working |
+| `metrics`, `metrics_updated_at` | Platform analytics — no source wired up | Empty |
+
+Stage 5's feedback loop reweights Stage 4 on *performance*, so it stays
+unbuilt until views and engagement come from somewhere — platform Graph/Display
+APIs, or a Zernio analytics endpoint if one exists that isn't in the client the
+`new-visu` app uses. Keeping the two columns apart is deliberate: "it posted"
+must never be mistaken for "it did well" once selection starts training on this
+data.
 
 ## Conventions
 

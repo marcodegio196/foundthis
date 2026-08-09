@@ -17,12 +17,25 @@ from typing import Any, Iterable, Iterator, Sequence
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 # Bumped when schema.sql changes in a way that needs a migration step.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Columns stored as JSON text. Read helpers decode them; write helpers encode.
 JSON_COLUMNS = frozenset(
-    {"subject_tags", "mood_tags", "platform_ids", "licensed_to", "metrics"}
+    {
+        "subject_tags", "mood_tags", "platform_ids", "licensed_to",
+        "delivery_status", "metrics",
+    }
 )
+
+# `CREATE TABLE IF NOT EXISTS` won't add a column to a table that already
+# exists, so each version's additive changes are replayed explicitly.
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: (
+        "ALTER TABLE shots ADD COLUMN zernio_post_id TEXT",
+        "ALTER TABLE shots ADD COLUMN delivery_status TEXT",
+        "ALTER TABLE shots ADD COLUMN delivery_checked_at TEXT",
+    ),
+}
 
 
 class Row(sqlite3.Row):
@@ -70,10 +83,25 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connecti
 def init_db(db_path: str | Path) -> sqlite3.Connection:
     """Create the database if needed and bring it up to `SCHEMA_VERSION`."""
     conn = connect(db_path)
-    conn.executescript(SCHEMA_PATH.read_text())
+    existing = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'shots'"
+    ).fetchone()[0]
     current = conn.execute("PRAGMA user_version").fetchone()[0]
-    if current < SCHEMA_VERSION:
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    conn.executescript(SCHEMA_PATH.read_text())
+
+    if existing:
+        for version in sorted(MIGRATIONS):
+            if current < version:
+                for statement in MIGRATIONS[version]:
+                    try:
+                        conn.execute(statement)
+                    except sqlite3.OperationalError as exc:
+                        # A fresh table already has the column; anything else is real.
+                        if "duplicate column name" not in str(exc):
+                            raise
+
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
     return conn
 

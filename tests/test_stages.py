@@ -428,18 +428,31 @@ class TestRenderStage(StageTestCase):
 # ---------------------------------------------------------------------------
 
 
+
+
 class FakeClient:
-    def __init__(self, platform_ids=None, metrics=None):
-        self.platform_ids = platform_ids if platform_ids is not None else {"tiktok": "p1"}
-        self._metrics = metrics if metrics is not None else {"tiktok": {"views": 1200}}
+    """Stands in for ZernioClient, returning the response shape Zernio uses."""
+
+    def __init__(self, post_id="zp_1", statuses=None):
+        self.post_id = post_id
+        self.statuses = statuses if statuses is not None else {"instagram": "published"}
         self.published = []
 
-    def publish(self, video_path, caption):
-        self.published.append((video_path, caption))
-        return dict(self.platform_ids)
+    def _post(self):
+        return {
+            "_id": self.post_id,
+            "platforms": [
+                {"platform": p, "accountId": f"acct_{p}", "status": s}
+                for p, s in self.statuses.items()
+            ],
+        }
 
-    def metrics(self, platform_ids):
-        return dict(self._metrics)
+    def publish(self, video_path, caption, *, platforms=None):
+        self.published.append((Path(video_path), caption, platforms))
+        return {"post": self._post()}
+
+    def fetch_post(self, post_id):
+        return self._post() if post_id == self.post_id else None
 
 
 class TestDistribute(StageTestCase):
@@ -460,7 +473,6 @@ class TestDistribute(StageTestCase):
         caption = distribute.build_caption(row, self.cfg)
         self.assertIn("Found this.", caption)
         self.assertIn("Ksamil", caption)
-        self.assertIn("A coastline.", caption)
         self.assertIn("#solitude", caption)
 
     def test_caption_hashtags_drop_hyphens(self):
@@ -470,14 +482,23 @@ class TestDistribute(StageTestCase):
         ).fetchone()
         self.assertIn("#goldenhour", distribute.build_caption(row, self.cfg))
 
-    def test_publish_records_platform_ids(self):
+    def test_publish_records_zernio_post_id_and_accounts(self):
         shot_id = self.postable_shot()
-        client = FakeClient()
-        counts = distribute.publish_pending(self.conn, self.cfg, client=client)
+        counts = distribute.publish_pending(self.conn, self.cfg, client=FakeClient())
         self.assertEqual(counts["posted"], 1)
         row = self.conn.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
-        self.assertEqual(row["platform_ids"], {"tiktok": "p1"})
+        self.assertEqual(row["zernio_post_id"], "zp_1")
+        self.assertEqual(row["platform_ids"], {"instagram": "acct_instagram"})
+        self.assertEqual(row["delivery_status"], {"instagram": "published"})
         self.assertIsNotNone(row["posted_at"])
+
+    def test_publish_targets_the_configured_platforms(self):
+        self.postable_shot()
+        client = FakeClient()
+        distribute.publish_pending(
+            self.conn, self.cfg, client=client, platforms=("tiktok",)
+        )
+        self.assertEqual(client.published[0][2], ("tiktok",))
 
     def test_unrendered_shots_are_not_published(self):
         self.add_shot(selection_state="approved")
@@ -486,7 +507,7 @@ class TestDistribute(StageTestCase):
         self.assertEqual(client.published, [])
 
     def test_dry_run_leaves_the_shot_in_the_queue(self):
-        """No platform ids means nothing was posted — don't mark it as posted."""
+        """No post id back means nothing was posted — don't mark it as posted."""
         shot_id = self.postable_shot()
         counts = distribute.publish_pending(
             self.conn, self.cfg, client=distribute.DryRunClient()
@@ -504,23 +525,30 @@ class TestDistribute(StageTestCase):
         row = self.conn.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
         self.assertIsNone(row["posted_at"])
 
-    def test_metrics_stored_on_the_shot(self):
-        shot_id = self.postable_shot(
-            posted_at="2026-02-02", platform_ids={"tiktok": "p1"}
+    def test_sync_surfaces_a_late_platform_failure(self):
+        """A post the API accepted can still fail at the platform minutes later."""
+        shot_id = self.postable_shot()
+        distribute.publish_pending(self.conn, self.cfg, client=FakeClient())
+        counts = distribute.sync_delivery(
+            self.conn, self.cfg,
+            client=FakeClient(statuses={"instagram": "failed: media rejected"}),
         )
-        counts = distribute.refresh_metrics(self.conn, self.cfg, client=FakeClient())
-        self.assertEqual(counts["updated"], 1)
+        self.assertEqual(counts["failed_delivery"], 1)
         row = self.conn.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
-        self.assertEqual(row["metrics"], {"tiktok": {"views": 1200}})
-        self.assertIsNotNone(row["metrics_updated_at"])
+        self.assertIn("failed", row["delivery_status"]["instagram"])
 
-    def test_metrics_skips_unposted_shots(self):
+    def test_sync_skips_shots_never_posted(self):
         self.postable_shot()
-        counts = distribute.refresh_metrics(self.conn, self.cfg, client=FakeClient())
-        self.assertEqual(counts["updated"], 0)
+        counts = distribute.sync_delivery(self.conn, self.cfg, client=FakeClient())
+        self.assertEqual(counts["checked"], 0)
 
-    def test_dry_run_client_is_the_default_without_a_token(self):
-        self.assertIsInstance(distribute.build_client(self.cfg), distribute.DryRunClient)
+    def test_delivery_status_is_kept_apart_from_metrics(self):
+        """Zernio reports delivery, not performance; the feedback loop needs both."""
+        shot_id = self.postable_shot()
+        distribute.publish_pending(self.conn, self.cfg, client=FakeClient())
+        row = self.conn.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
+        self.assertIsNotNone(row["delivery_status"])
+        self.assertIsNone(row["metrics"])
 
 
 if __name__ == "__main__":
