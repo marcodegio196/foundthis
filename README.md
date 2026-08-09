@@ -72,6 +72,14 @@ export ZERNIO_PROFILE_ID=...                 # optional
 export SOCIAL_PLATFORMS=instagram,tiktok
 ```
 
+`OVERLAY_FONT` is required for the burned-in text on Linux and Windows (macOS
+falls back to a system font). Windows paths are escaped for ffmpeg
+automatically — set it raw:
+
+```powershell
+$env:OVERLAY_FONT = "C:\Windows\Fonts\segoeui.ttf"
+```
+
 Accounts are connected through Zernio's OAuth redirect (`GET /connect/{platform}`),
 which is an interactive browser flow — do it in the new-visu web app. This
 pipeline only reads accounts that are already connected.

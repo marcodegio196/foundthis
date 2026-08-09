@@ -167,6 +167,12 @@ class TestRenderCommands(unittest.TestCase):
         command = self.social(font_file="/fonts/Inter.ttf")
         self.assertIn("fontfile=", command[command.index("-vf") + 1])
 
+    def test_windows_font_path_is_escaped(self):
+        """A raw C:\\ path breaks drawtext — the drive colon reads as a separator."""
+        command = self.social(font_file=r"C:\Windows\Fonts\segoeui.ttf")
+        filters = command[command.index("-vf") + 1]
+        self.assertIn(r"fontfile='C\:\\Windows\\Fonts\\segoeui.ttf'", filters)
+
     def test_licensing_master_has_no_overlay(self):
         command = render.build_licensing_command(
             "/a/in.mp4", "/b/out.mov", in_point=2.0, out_point=9.5
