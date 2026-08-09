@@ -47,6 +47,14 @@ class Config:
     # Stage 4
     render_root: Path = _path("RENDER_ROOT", "./renders")
     overlay_text: str = os.environ.get("OVERLAY_TEXT", "Found this.")
+    # ffmpeg's drawtext needs an explicit font file on most Linux builds; on
+    # macOS it falls back to the system font when this is unset.
+    overlay_font: str | None = os.environ.get("OVERLAY_FONT") or None
+    licensing_codec: str = os.environ.get("LICENSING_CODEC", "libx264")
+
+    # Stage 5
+    zernio_base_url: str = os.environ.get("ZERNIO_BASE_URL", "https://api.zernio.com")
+    zernio_token: str | None = os.environ.get("ZERNIO_TOKEN") or None
 
     @property
     def social_render_dir(self) -> Path:

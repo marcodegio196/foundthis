@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -41,6 +42,11 @@ class Row(sqlite3.Row):
 
     def dict(self) -> dict[str, Any]:
         return {key: self[key] for key in self.keys()}
+
+
+def now() -> str:
+    """UTC timestamp in the same format the schema's DEFAULTs produce."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
