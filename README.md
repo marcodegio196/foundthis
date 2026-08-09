@@ -97,6 +97,39 @@ The database layer and CLI deliberately need neither.
 | 4 — select & render | Built. Approval is a manual step until the format is validated |
 | 5 — distribute & learn | Built. Zernio client ported from the working integration in `new-visu`, dry-run until `ZERNIO_API_KEY` is set. Delivery status works; **performance metrics have no source yet** — see below |
 
+## Everything stays on local disk
+
+Raw footage is never written to, moved, or deleted — the pipeline only reads it.
+Renders and exports go into their own trees, mirroring the `archive/<country>/`
+convention so they're browsable in Explorer without opening the database:
+
+```
+archive/albania/DJI_0001.MP4              # untouched, read-only
+renders/social/albania/2024/000012_dji_0001_ksamil.mp4
+renders/licensing/albania/2024/000012_dji_0001_ksamil.mp4
+exports/non-exclusive/albania/2024/000012_dji_0001_ksamil.mp4
+exports/non-exclusive/albania/2024/000012_dji_0001_ksamil.json
+exports/non-exclusive/manifest.csv
+```
+
+Filenames lead with the zero-padded shot id so they sort stably and map back to
+a database row, and keep the source name so a file found on disk can be traced
+to its original clip without a query. Paths are deterministic, so re-rendering
+overwrites rather than accumulating a second copy. Undated footage sorts into
+`undated/` rather than a guessed year.
+
+```bash
+python3 -m pipeline.cli export --dry-run              # see what would go out
+python3 -m pipeline.cli export --tier non-exclusive   # one marketplace batch
+```
+
+`export` assembles the licensing deliverable: the clean master, a per-clip JSON
+sidecar (title, keywords, location, GPS, drone model, resolution, provenance),
+and one `manifest.csv` for the batch. **Masters are hard-linked, not copied**,
+where the filesystem allows it — a second name for the same bytes, costing no
+extra disk. It falls back to a copy on external or network drives that don't
+support links, and deleting an export never touches the render.
+
 ## Delivery status is not performance
 
 Zernio's API covers `accounts`, `connect`, `posts`, `media/presign`, `logs`, and

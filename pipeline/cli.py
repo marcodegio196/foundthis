@@ -153,6 +153,21 @@ def cmd_render(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    from .stages import export_catalog
+
+    conn = _open(args, read_only=True)
+    try:
+        return _report(
+            "export",
+            export_catalog.run(
+                conn, config, tier=args.tier, limit=args.limit, dry_run=args.dry_run
+            ),
+        )
+    finally:
+        conn.close()
+
+
 def cmd_publish(args: argparse.Namespace) -> int:
     from .stages import distribute
 
@@ -225,6 +240,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["social", "licensing"],
     )
     render.set_defaults(func=cmd_render)
+
+    export = sub.add_parser(
+        "export", help="assemble a local licensing delivery folder (masters + metadata)"
+    )
+    export.add_argument("--tier", choices=["public", "non-exclusive", "exclusive"])
+    export.add_argument("--limit", type=int)
+    export.add_argument("--dry-run", action="store_true", help="report without writing")
+    export.set_defaults(func=cmd_export)
 
     publish = sub.add_parser("publish", help="stage 5: post via Zernio, then check delivery")
     publish.add_argument("--limit", type=int)

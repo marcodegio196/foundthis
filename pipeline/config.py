@@ -59,6 +59,10 @@ class Config:
         p.strip() for p in os.environ.get("SOCIAL_PLATFORMS", "instagram,tiktok").split(",") if p.strip()
     )
 
+    # Stage 4 outputs and stage 6 exports all stay on local disk. Nothing in the
+    # pipeline ever deletes or moves a file under archive_root.
+    export_root: Path = _path("EXPORT_ROOT", "./exports")
+
     @property
     def social_render_dir(self) -> Path:
         return self.render_root / "social"

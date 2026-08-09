@@ -12,7 +12,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from .. import db, media, render
+from .. import db, layout, media, render
 from ..config import Config, config as default_config
 
 log = logging.getLogger(__name__)
@@ -118,10 +118,19 @@ def render_shot(
 ) -> dict[str, str]:
     """Render one approved shot into the requested profiles."""
     written: dict[str, str] = {}
-    stem = f"{row['id']:06d}_{Path(row['source_relpath']).stem}"
+
+    def target_for(root: Path) -> Path:
+        return layout.render_path(
+            root,
+            shot_id=row["id"],
+            source_relpath=row["source_relpath"],
+            country=row["country"],
+            captured_at=row["captured_at"],
+            site=row["site"],
+        )
 
     if "social" in profiles:
-        target = cfg.social_render_dir / f"{stem}.mp4"
+        target = target_for(cfg.social_render_dir)
         target.parent.mkdir(parents=True, exist_ok=True)
         lines = overlay_for(row, cfg)
         media.run(
@@ -137,7 +146,7 @@ def render_shot(
         written["social"] = str(target)
 
     if "licensing" in profiles:
-        target = cfg.licensing_render_dir / f"{stem}.mp4"
+        target = target_for(cfg.licensing_render_dir)
         target.parent.mkdir(parents=True, exist_ok=True)
         media.run(
             render.build_licensing_command(
