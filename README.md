@@ -21,16 +21,37 @@ Full design: [`docs/architecture.md`](docs/architecture.md).
 | `pipeline/schema.sql` | The spine — `sources`, `shots`, and the `shot_details` view |
 | `pipeline/db.py` | Connection, migrations, and the per-stage queue queries |
 | `pipeline/config.py` | Paths and thresholds, all env-overridable |
-| `pipeline/cli.py` | `init` / `stats` / `queue` |
-| `tests/` | Schema and DB-layer tests (stdlib `unittest`, no deps needed) |
+| `pipeline/media.py` | The only module that shells out to ffmpeg/ffprobe |
+| `pipeline/scoring.py` | Stage 2 maths — pure, no OpenCV or torch needed to test |
+| `pipeline/aesthetic.py` | Optional CLIP+MLP aesthetic head |
+| `pipeline/render.py` | Stage 4 ffmpeg command construction — pure |
+| `pipeline/stages/` | One module per stage, each `run(conn, cfg, **options) -> dict` |
+| `pipeline/cli.py` | One subcommand per stage, plus `init` / `stats` |
+| `tests/` | 127 tests (stdlib `unittest`, no deps needed) |
 
 ## Getting started
 
 ```bash
-python3 -m pipeline.cli init      # create ./pipeline.db
-python3 -m pipeline.cli stats     # see how far the archive has moved
-python3 -m pipeline.cli queue     # shots awaiting a stage 4 decision
-python3 -m unittest discover tests
+python3 -m pipeline.cli init                 # create ./pipeline.db
+python3 -m unittest discover tests           # 127 tests, no dependencies
+
+python3 -m pipeline.cli -v ingest            # 1a: register source files
+python3 -m pipeline.cli -v segment           # 1b: split into shots
+python3 -m pipeline.cli -v score             # 2:  score, then cut the bottom
+python3 -m pipeline.cli -v tag               # 3:  describe survivors
+python3 -m pipeline.cli queue --stage        # 4:  propose shots to review
+python3 -m pipeline.cli approve 12 47 93     # 4:  approve them
+python3 -m pipeline.cli -v render            # 4:  render both profiles
+python3 -m pipeline.cli -v publish           # 5:  post + pull metrics
+
+python3 -m pipeline.cli stats                # how far the archive has moved
+```
+
+Re-drawing the Stage 2 bar doesn't need a rescore — scoring and rejection are
+separate passes:
+
+```bash
+REJECT_PERCENTILE=0.25 python3 -m pipeline.cli score --rejections-only --dry-run
 ```
 
 Configuration is environment-driven, so the same code runs against the real
@@ -49,11 +70,11 @@ The database layer and CLI deliberately need neither.
 
 | Stage | State |
 |---|---|
-| 1 — ingest & segment | Written and tested locally (`01_ingest.py`, `02_scene_detect.py`), **not yet in this repo** |
-| 2 — score & filter | Schema in place, runner not built |
-| 3 — tag & describe | Schema in place, runner not built |
-| 4 — select & render | Designed |
-| 5 — distribute & learn | Zernio side ready; feedback loop later |
+| 1 — ingest & segment | Built. Rewritten here rather than ported from `01_ingest.py` / `02_scene_detect.py`, which were never pushed to this repo |
+| 2 — score & filter | Built. Aesthetic component needs `AESTHETIC_WEIGHTS`; without it the run uses motion and technical quality alone |
+| 3 — tag & describe | Built. Needs `ANTHROPIC_API_KEY` |
+| 4 — select & render | Built. Approval is a manual step until the format is validated |
+| 5 — distribute & learn | Built against the expected Zernio API shape — **endpoint paths unverified**, dry-run until `ZERNIO_TOKEN` is set |
 
 ## Conventions
 
