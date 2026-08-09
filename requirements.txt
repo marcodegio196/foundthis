@@ -1,0 +1,17 @@
+# Stage 1 — ingest & segment
+# ffprobe/ffmpeg are external binaries, not pip packages; install them separately.
+scenedetect==0.6.4
+av==13.1.0
+
+# Stage 2 — score & filter
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+Pillow==10.4.0
+
+# Stage 2/3 — CLIP aesthetic predictor and VLM tagging
+# Pinned loosely; swap for the torch build matching your CUDA/MPS setup.
+torch>=2.2
+open-clip-torch==2.26.1
+
+# Config (optional — pipeline.db and pipeline.cli run without it)
+python-dotenv==1.0.1

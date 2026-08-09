@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Pipeline state — the DB is derived data, rebuildable from the archive
+*.db
+*.db-wal
+*.db-shm
+
+# Rendered output and working files
+renders/
+work/
+*.log
+
+.DS_Store
+.idea/
+.vscode/
