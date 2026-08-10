@@ -3,6 +3,11 @@ __pycache__/
 .venv/
 venv/
 
+# Credentials. .env.example is committed; the filled-in copy never is.
+.env
+.env.local
+*.pem
+
 # Pipeline state — the DB is derived data, rebuildable from the archive
 *.db
 *.db-wal
