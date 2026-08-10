@@ -91,7 +91,7 @@ def score_shot(
 
     return scoring.Scores(
         motion=scoring.motion_score(flows, width),
-        stability=scoring.stability_score(flows),
+        stability=scoring.stability_score(flows, width),
         technical=scoring.technical_score(sharpness, clipped),
         aesthetic=aesthetic_value,
     )

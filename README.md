@@ -26,14 +26,16 @@ Full design: [`docs/architecture.md`](docs/architecture.md).
 | `pipeline/aesthetic.py` | Optional CLIP+MLP aesthetic head |
 | `pipeline/render.py` | Stage 4 ffmpeg command construction — pure |
 | `pipeline/stages/` | One module per stage, each `run(conn, cfg, **options) -> dict` |
-| `pipeline/cli.py` | One subcommand per stage, plus `init` / `stats` |
-| `tests/` | 127 tests (stdlib `unittest`, no deps needed) |
+| `pipeline/zernio.py` | Zernio API client, stdlib only |
+| `pipeline/layout.py` | Where files land on disk |
+| `pipeline/cli.py` | One subcommand per stage, plus `init` / `stats` / `export` |
+| `tests/` | 227 tests. Most need no dependencies; `test_integration.py` renders real video and skips itself when ffmpeg or OpenCV are absent |
 
 ## Getting started
 
 ```bash
 python3 -m pipeline.cli init                 # create ./pipeline.db
-python3 -m unittest discover tests           # 127 tests, no dependencies
+python3 -m unittest discover tests           # 227 tests
 
 python3 -m pipeline.cli -v ingest            # 1a: register source files
 python3 -m pipeline.cli -v segment           # 1b: split into shots
@@ -129,6 +131,29 @@ and one `manifest.csv` for the batch. **Masters are hard-linked, not copied**,
 where the filesystem allows it — a second name for the same bytes, costing no
 extra disk. It falls back to a copy on external or network drives that don't
 support links, and deleting an export never touches the render.
+
+## What Stage 2 actually measures
+
+The stability score is the one Stage 2 leans on, so it's validated against
+frames with displacements chosen in advance rather than assumed
+(`tests/test_integration.py`):
+
+| Shot | Stability | Motion | Technical |
+|---|---:|---:|---:|
+| Smooth pan | 1.00 | 0.44 | 0.95 |
+| Locked off (incl. sensor noise) | 1.00 | 0.00 | 0.95 |
+| Blurred pan | 1.00 | 0.38 | **0.40** |
+| Handheld shake | 0.63 | 0.29 | 0.95 |
+| Drifting hover | 0.35 | 0.22 | 0.95 |
+
+A held shot and a deliberate pan both score 1.00; shake and aimless drift fall
+away. A blurred pan is *correctly* stable — it's the technical score that
+catches it, which is why the two are separate components rather than one number.
+
+Two things that only showed up against real footage: identical frames still
+produce ~0.0002px of optical flow, and footage with sensor noise ~0.03px, so
+"no movement" has to be a realistic threshold rather than exact zero — a real
+one-pixel-per-frame pan measures 1.0px, leaving a wide margin.
 
 ## Delivery status is not performance
 

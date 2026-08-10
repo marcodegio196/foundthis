@@ -3,10 +3,11 @@
 scenedetect==0.6.4
 av==13.1.0
 
-# Stage 2 — score & filter
-opencv-python-headless==4.10.0.84
-numpy==1.26.4
-Pillow==10.4.0
+# Stage 2 — score & filter. Loose pins: verified against opencv 5.0 / numpy 2.4,
+# and the optical-flow call is stable across both major versions.
+opencv-python-headless>=4.10
+numpy>=1.26
+Pillow>=10.4
 
 # Stage 2/3 — CLIP aesthetic predictor and VLM tagging
 # Pinned loosely; swap for the torch build matching your CUDA/MPS setup.

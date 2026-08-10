@@ -27,6 +27,14 @@ WEIGHTS = {
 # out-of-focus or blown-out footage has no use in either output.
 HARD_FLOORS = {"technical": 0.15}
 
+# Mean flow below this is not camera movement, it is noise, and the coherence
+# ratio below becomes a ratio of two noisy near-zero numbers. Measured against
+# known displacements at 512px wide: identical frames give 0.0002px, footage
+# with sensor noise 0.03px, and sub-pixel drift 0.11px, while a real one-pixel-
+# per-frame pan gives 1.0px. Expressed as a fraction of frame width so the
+# threshold means the same thing at any extraction size.
+STATIC_FLOW_FRACTION = 0.0003
+
 
 @dataclass(frozen=True)
 class FrameFlow:
@@ -65,7 +73,9 @@ def motion_score(flows: Sequence[FrameFlow], frame_width: int) -> float | None:
     return _clamp(math.tanh((mean_magnitude / frame_width) / 0.04))
 
 
-def stability_score(flows: Sequence[FrameFlow]) -> float | None:
+def stability_score(
+    flows: Sequence[FrameFlow], frame_width: int | None = None
+) -> float | None:
     """Whether the movement is deliberate, on a scale of drift to shake.
 
     Two signals, multiplied:
@@ -77,15 +87,20 @@ def stability_score(flows: Sequence[FrameFlow]) -> float | None:
     - *consistency* — how steady that magnitude is between samples. A push-in
       holds its speed; a bumpy hover oscillates.
 
-    A locked-off tripod shot has no flow to be coherent about, and is treated as
-    perfectly stable rather than punished for it.
+    A locked-off shot has no flow to be coherent about, and is treated as
+    perfectly stable rather than punished for it. That branch has to trigger on
+    *real* footage, where compression and sensor noise put the floor near 0.03px
+    rather than at zero — see `STATIC_FLOW_FRACTION`.
     """
     if not flows:
         return None
 
     magnitudes = [f.magnitude for f in flows]
     mean_magnitude = sum(magnitudes) / len(magnitudes)
-    if mean_magnitude < 1e-6:
+    static_threshold = (
+        STATIC_FLOW_FRACTION * frame_width if frame_width else 0.15
+    )
+    if mean_magnitude < static_threshold:
         return 1.0
 
     mean_dx = sum(f.dx for f in flows) / len(flows)

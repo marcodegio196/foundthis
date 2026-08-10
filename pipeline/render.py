@@ -39,20 +39,40 @@ def overlay_lines(
     return [headline, subtitle] if subtitle else [headline]
 
 
+VERTICAL_ASPECT = 9 / 16
+
+
+def _even(value: float) -> int:
+    """Nearest even integer — odd dimensions break yuv420p encoding."""
+    rounded = int(round(value))
+    return max(2, rounded - (rounded % 2))
+
+
+def vertical_output_size(output_height: int) -> tuple[int, int]:
+    """Exact 9:16 output dimensions, e.g. 1920 -> (1080, 1920)."""
+    return _even(output_height * VERTICAL_ASPECT), _even(output_height)
+
+
 def crop_to_vertical(width: int, height: int) -> str | None:
-    """Centre-crop filter taking a landscape source to 9:16, or None if it already is.
+    """Centre-crop filter bringing a source to 9:16, or None if it already is.
 
     Cropping 16:9 to 9:16 keeps only the middle ~32% of the frame, so a shot
     whose subject sits off-centre is better served by a native 9:16 master —
     which is why the selection query prefers those.
+
+    The crop cannot always land on exactly 9:16: a 720-tall source wants a
+    405-wide crop, and odd widths break yuv420p. The residual fraction of a
+    percent is taken out by the scale filter, which pins the final size.
     """
     if width <= 0 or height <= 0:
         return None
-    target = 9 / 16
-    if abs(width / height - target) < 0.01:
+    ratio = width / height
+    if abs(ratio - VERTICAL_ASPECT) < 0.001:
         return None
-    crop_width = int(height * target) // 2 * 2
-    return f"crop={crop_width}:{height}"
+    if ratio > VERTICAL_ASPECT:  # landscape or square: trim the sides
+        return f"crop={min(_even(height * VERTICAL_ASPECT), _even(width))}:{_even(height)}"
+    # Taller than 9:16 (rare): trim top and bottom instead of overcropping.
+    return f"crop={_even(width)}:{min(_even(width / VERTICAL_ASPECT), _even(height))}"
 
 
 def build_social_command(
@@ -68,8 +88,13 @@ def build_social_command(
     output_height: int = 1920,
 ) -> list[str]:
     """9:16, overlay burned in, compressed for platform delivery."""
+    out_width, out_height = vertical_output_size(output_height)
     filters = [f for f in (crop_to_vertical(width, height),) if f]
-    filters.append(f"scale=-2:{output_height}")
+    # Pinned to exact dimensions rather than derived with -2: a source whose
+    # crop can't land on exactly 9:16 would otherwise produce something like
+    # 1078x1920, which platforms re-encode. setsar=1 stops a non-square pixel
+    # aspect surviving from the source and skewing playback.
+    filters.append(f"scale={out_width}:{out_height},setsar=1")
 
     # Lines are drawn from the lower third upward, the safe area on every
     # platform once captions and UI chrome are accounted for.

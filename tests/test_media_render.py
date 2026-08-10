@@ -125,11 +125,46 @@ class TestCrop(unittest.TestCase):
     def test_native_vertical_not_cropped(self):
         self.assertIsNone(render.crop_to_vertical(2160, 3840))
 
-    def test_crop_width_is_even(self):
+    def test_taller_than_vertical_is_trimmed_top_and_bottom(self):
+        """Cropping width on an already-narrow source would overcrop it."""
+        self.assertEqual(render.crop_to_vertical(1080, 2400), "crop=1080:1920")
+
+    def test_all_crop_dimensions_are_even(self):
         """Odd dimensions break yuv420p encoding."""
-        for width, height in ((1920, 1080), (3840, 2160), (1280, 719)):
+        for width, height in (
+            (1920, 1080), (3840, 2160), (1280, 719), (481, 481), (1080, 2401)
+        ):
             crop = render.crop_to_vertical(width, height)
-            self.assertEqual(int(crop.split("=")[1].split(":")[0]) % 2, 0)
+            dims = crop.split("=")[1].split(":")
+            self.assertEqual([int(d) % 2 for d in dims], [0, 0], crop)
+
+    def test_crop_never_exceeds_the_source(self):
+        for width, height in ((1920, 1080), (100, 5000), (5000, 100)):
+            crop = render.crop_to_vertical(width, height)
+            if crop:
+                crop_w, crop_h = (int(d) for d in crop.split("=")[1].split(":"))
+                self.assertLessEqual(crop_w, width)
+                self.assertLessEqual(crop_h, height)
+
+
+class TestVerticalOutputSize(unittest.TestCase):
+    def test_standard_size(self):
+        self.assertEqual(render.vertical_output_size(1920), (1080, 1920))
+
+    def test_alternate_sizes_stay_even_and_9x16(self):
+        for height in (1280, 1600, 1920, 2160):
+            width, out_height = render.vertical_output_size(height)
+            self.assertEqual(width % 2, 0)
+            self.assertEqual(out_height % 2, 0)
+            self.assertAlmostEqual(width / out_height, 9 / 16, places=2)
+
+    def test_scale_filter_pins_exact_dimensions(self):
+        """Deriving width with -2 produced 1078x1920 from a 720-tall source."""
+        command = render.build_social_command(
+            "/a.mp4", "/b.mp4", in_point=0, out_point=1,
+            width=1280, height=720, lines=["x"],
+        )
+        self.assertIn("scale=1080:1920,setsar=1", command[command.index("-vf") + 1])
 
 
 class TestRenderCommands(unittest.TestCase):
