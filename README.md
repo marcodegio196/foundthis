@@ -56,6 +56,15 @@ separate passes:
 REJECT_PERCENTILE=0.25 python3 -m pipeline.cli score --rejections-only --dry-run
 ```
 
+Scoring is the long pass on a large archive, so shots are measured in parallel
+(default `min(8, cores)`; `--workers 1` for serial). Measurement runs on worker
+threads and every database write stays on the calling thread, since SQLite
+connections aren't safe to share. Progress is logged periodically with a rate
+and an estimate, because silence for hours is indistinguishable from a hang.
+
+Every stage is resumable: each shot is committed as it completes, so an
+interrupted run is continued by re-running the same command.
+
 Configuration is environment-driven, so the same code runs against the real
 archive or a small test folder:
 

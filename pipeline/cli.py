@@ -127,7 +127,9 @@ def cmd_score(args: argparse.Namespace) -> int:
     try:
         if args.rejections_only:
             return _report("reject", score.apply_rejections(conn, config, dry_run=args.dry_run))
-        return _report("score", score.run(conn, config, limit=args.limit))
+        return _report(
+            "score", score.run(conn, config, limit=args.limit, workers=args.workers)
+        )
     finally:
         conn.close()
 
@@ -218,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-draw the bar over existing scores without re-decoding frames",
     )
     score.add_argument("--dry-run", action="store_true", help="with --rejections-only, don't write")
+    score.add_argument(
+        "--workers", type=int, default=None,
+        help=f"shots scored in parallel (default {config.score_workers}; 1 = serial)",
+    )
     score.set_defaults(func=cmd_score)
 
     tag = sub.add_parser("tag", help="stage 3: describe surviving shots with a VLM")

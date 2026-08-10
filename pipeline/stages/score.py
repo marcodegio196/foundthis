@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import sqlite3
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .. import db, media, scoring
@@ -22,6 +24,10 @@ from ..aesthetic import AestheticScorer, load_scorer, null_scorer
 from ..config import Config, config as default_config
 
 log = logging.getLogger(__name__)
+
+# How often to report progress on a long run. Scoring a full archive is an
+# hours-long job; silence for that long is indistinguishable from a hang.
+PROGRESS_EVERY = 25
 
 
 def analyse_frames(frame_paths: list[Path]) -> tuple[list[scoring.FrameFlow], list[float], list[float], int]:
@@ -97,40 +103,84 @@ def score_shot(
     )
 
 
+def _persist(conn: sqlite3.Connection, shot_id: int, scores: scoring.Scores) -> None:
+    with db.transaction(conn):
+        db.update_shot(
+            conn,
+            shot_id,
+            motion_score=scores.motion,
+            stability_score=scores.stability,
+            technical_score=scores.technical,
+            aesthetic_score=scores.aesthetic,
+            scored_at=db.now(),
+        )
+
+
 def score_pending(
     conn: sqlite3.Connection,
     cfg: Config = default_config,
     *,
     limit: int | None = None,
     aesthetic: AestheticScorer | None = None,
+    workers: int | None = None,
 ) -> dict[str, int]:
-    """Pass 1 — measure every shot that has no scores yet."""
+    """Pass 1 — measure every shot that has no scores yet.
+
+    Each shot is independent, and the expensive parts (an ffmpeg subprocess per
+    shot, then optical flow inside OpenCV) both spend their time outside the
+    interpreter lock, so threads give real parallelism here without the cost of
+    handing rows to separate processes.
+
+    Measurement happens on the workers; **every database write happens on this
+    thread**. SQLite connections are not shared safely across threads, and
+    serialising the writes costs nothing next to decoding 4K frames.
+    """
     aesthetic = aesthetic if aesthetic is not None else load_scorer()
+    workers = workers if workers is not None else cfg.score_workers
+    rows = db.shots_pending_scoring(conn, limit=limit)
     counts = {"scored": 0, "failed": 0}
+    if not rows:
+        return counts
 
-    for row in db.shots_pending_scoring(conn, limit=limit):
-        try:
-            scores = score_shot(row, cfg, aesthetic)
-        except Exception as exc:  # one unreadable file must not stall the pass
-            log.warning("scoring failed for shot %s: %s", row["id"], exc)
+    total = len(rows)
+    started = time.monotonic()
+
+    def record(row: db.Row, scores: scoring.Scores | None, error: Exception | None) -> None:
+        if error is not None:  # one unreadable file must not stall the pass
+            log.warning("scoring failed for shot %s: %s", row["id"], error)
             counts["failed"] += 1
-            continue
-
-        with db.transaction(conn):
-            db.update_shot(
-                conn,
-                row["id"],
-                motion_score=scores.motion,
-                stability_score=scores.stability,
-                technical_score=scores.technical,
-                aesthetic_score=scores.aesthetic,
-                scored_at=db.now(),
-            )
+            return
+        _persist(conn, row["id"], scores)
         counts["scored"] += 1
         log.info(
             "shot %s: motion=%s stability=%s technical=%s aesthetic=%s",
             row["id"], scores.motion, scores.stability, scores.technical, scores.aesthetic,
         )
+        done = counts["scored"] + counts["failed"]
+        if done % PROGRESS_EVERY == 0 or done == total:
+            rate = done / max(time.monotonic() - started, 1e-6)
+            remaining = (total - done) / rate if rate else 0
+            log.warning(  # deliberately at warning so it shows without -v
+                "scored %d/%d shots (%.1f/min, ~%d min left)",
+                done, total, rate * 60, round(remaining / 60),
+            )
+
+    if workers <= 1:
+        for row in rows:
+            try:
+                record(row, score_shot(row, cfg, aesthetic), None)
+            except Exception as exc:
+                record(row, None, exc)
+        return counts
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {pool.submit(score_shot, row, cfg, aesthetic): row for row in rows}
+        for future in as_completed(pending):
+            row = pending[future]
+            try:
+                record(row, future.result(), None)
+            except Exception as exc:
+                record(row, None, exc)
 
     return counts
 
@@ -210,6 +260,9 @@ def run(
     *,
     limit: int | None = None,
     aesthetic: AestheticScorer | None = None,
+    workers: int | None = None,
 ) -> dict[str, object]:
-    scored = score_pending(conn, cfg, limit=limit, aesthetic=aesthetic)
+    scored = score_pending(
+        conn, cfg, limit=limit, aesthetic=aesthetic, workers=workers
+    )
     return {**scored, **apply_rejections(conn, cfg)}

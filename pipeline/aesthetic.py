@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -33,7 +34,12 @@ def null_scorer(frame_paths: Sequence[Path]) -> float | None:
 
 
 class ClipAestheticScorer:
-    """Lazily loads CLIP + the MLP head on first call."""
+    """Lazily loads CLIP + the MLP head on first call.
+
+    Stage 2 scores shots from a thread pool, so both the lazy load and the
+    forward pass are serialised — two threads loading the model at once would
+    otherwise race, and a shared torch module is not safe to run concurrently.
+    """
 
     def __init__(self, weights_path: Path, model_name: str, pretrained: str, device: str):
         self.weights_path = weights_path
@@ -43,6 +49,7 @@ class ClipAestheticScorer:
         self._model = None
         self._preprocess = None
         self._head = None
+        self._lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
         if self._head is not None:
@@ -72,19 +79,20 @@ class ClipAestheticScorer:
     def __call__(self, frame_paths: Sequence[Path]) -> float | None:
         if not frame_paths:
             return None
-        self._ensure_loaded()
 
         import torch
         from PIL import Image
 
-        batch = torch.stack(
-            [self._preprocess(Image.open(p).convert("RGB")) for p in frame_paths]
-        ).to(self.device)
+        with self._lock:
+            self._ensure_loaded()
+            batch = torch.stack(
+                [self._preprocess(Image.open(p).convert("RGB")) for p in frame_paths]
+            ).to(self.device)
 
-        with torch.no_grad():
-            features = self._model.encode_image(batch)
-            features = features / features.norm(dim=-1, keepdim=True)
-            ratings = self._head(features.float()).squeeze(-1)
+            with torch.no_grad():
+                features = self._model.encode_image(batch)
+                features = features / features.norm(dim=-1, keepdim=True)
+                ratings = self._head(features.float()).squeeze(-1)
 
         return round(min(1.0, max(0.0, ratings.mean().item() / RATING_MAX)), 4)
 

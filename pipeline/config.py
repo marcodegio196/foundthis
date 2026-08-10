@@ -27,6 +27,10 @@ def _float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def _int(name: str, default: int) -> int:
+    return int(os.environ.get(name, default))
+
+
 @dataclass(frozen=True)
 class Config:
     # Stage 1
@@ -43,6 +47,11 @@ class Config:
     # Stage 2 — bottom percentile is flagged, never deleted.
     reject_percentile: float = _float("REJECT_PERCENTILE", 0.35)
     sample_fps: float = _float("SAMPLE_FPS", 1.0)
+    # Shots scored in parallel. Each worker runs an ffmpeg subprocess and an
+    # optical-flow pass, so this is bounded by cores and by how fast the drive
+    # holding the archive can feed them — past ~8 an external disk is usually
+    # the limit, not the CPU.
+    score_workers: int = _int("SCORE_WORKERS", min(8, (os.cpu_count() or 2)))
 
     # Stage 4
     render_root: Path = _path("RENDER_ROOT", "./renders")

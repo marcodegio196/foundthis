@@ -369,3 +369,106 @@ class TestScoringAgainstKnownMotion(unittest.TestCase):
         self.assertGreater(combined["pan"], combined["shake"])
         self.assertGreater(combined["locked"], combined["shake"])
         self.assertGreater(combined["shake"], combined["hover"])
+
+
+try:
+    import scenedetect  # noqa: F401
+    HAS_SCENEDETECT = True
+except ImportError:  # pragma: no cover
+    HAS_SCENEDETECT = False
+
+
+@unittest.skipUnless(HAS_FFMPEG and HAS_SCENEDETECT, "ffmpeg or scenedetect missing")
+class TestRealSceneDetection(IntegrationTestCase):
+    """Exercise the actual detector.
+
+    Without scenedetect installed, `detect_segments` falls back to one
+    whole-file shot — which means the detector path and the merge logic that
+    consumes its output are never executed by the rest of the suite.
+    """
+
+    def concat(self, name: str, clips: list[Path]) -> Path:
+        listing = self.root / f"{name}.txt"
+        listing.write_text("".join(f"file '{c}'\n" for c in clips))
+        out = self.root / f"{name}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(listing),
+                "-c", "copy", str(out),
+            ],
+            check=True, capture_output=True,
+        )
+        return out
+
+    def hued_clip(self, name: str, hue: int, duration: int) -> Path:
+        out = self.root / f"{name}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi",
+                "-i", f"testsrc2=size=640x360:rate=30:duration={duration}",
+                "-vf", f"hue=h={hue}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out),
+            ],
+            check=True, capture_output=True,
+        )
+        return out
+
+    def panning_clip(self, name: str, duration: int) -> Path:
+        still = self.root / f"{name}.png"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=1:duration=1",
+                "-frames:v", "1", str(still),
+            ],
+            check=True, capture_output=True,
+        )
+        out = self.root / f"{name}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-loop", "1", "-i", str(still), "-t", str(duration), "-r", "30",
+                "-vf", "crop=640:360:x='min(t*100,1200)':y=360",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out),
+            ],
+            check=True, capture_output=True,
+        )
+        return out
+
+    def test_finds_the_cuts(self):
+        clips = [self.hued_clip(f"seg{i}", i * 120, 3) for i in range(1, 4)]
+        segments = scene_detect.detect_segments(self.concat("cuts", clips), 9.0, self.cfg)
+        self.assertEqual(len(segments), 3)
+        for (start, end), expected in zip(segments, [(0, 3), (3, 6), (6, 9)]):
+            self.assertAlmostEqual(start, expected[0], delta=0.2)
+            self.assertAlmostEqual(end, expected[1], delta=0.2)
+
+    def test_continuous_move_stays_one_shot(self):
+        """The common case for drone footage — a slow reveal must not be chopped."""
+        clip = self.panning_clip("continuous", 8)
+        segments = scene_detect.detect_segments(clip, 8.0, self.cfg)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0], (0.0, 8.0))
+
+    def test_short_tail_is_merged_into_its_neighbour(self):
+        """A one-second sliver is a detector artifact, not a shot."""
+        clips = [
+            self.hued_clip("a", 0, 3),
+            self.hued_clip("b", 120, 3),
+            self.hued_clip("c", 240, 1),
+        ]
+        segments = scene_detect.detect_segments(self.concat("sliver", clips), 7.0, self.cfg)
+        self.assertEqual(len(segments), 2)
+        self.assertAlmostEqual(segments[-1][1], 7.0, delta=0.2)
+        for start, end in segments:
+            self.assertGreaterEqual(end - start, self.cfg.min_shot_seconds)
+
+    def test_segments_tile_the_whole_timeline(self):
+        clips = [self.hued_clip(f"t{i}", i * 120, 3) for i in range(1, 4)]
+        segments = scene_detect.detect_segments(self.concat("tile", clips), 9.0, self.cfg)
+        self.assertEqual(segments[0][0], 0.0)
+        self.assertAlmostEqual(segments[-1][1], 9.0, delta=0.2)
+        for (_, end), (start, _) in zip(segments, segments[1:]):
+            self.assertEqual(end, start)

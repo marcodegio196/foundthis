@@ -6,6 +6,7 @@ what a failure does to the rest of the batch — without the toolchain.
 """
 
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -553,3 +554,111 @@ class TestDistribute(StageTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestScoreConcurrency(StageTestCase):
+    """Parallel scoring must agree with serial scoring, exactly.
+
+    Measurement runs on worker threads; every database write is supposed to
+    happen on the calling thread, because SQLite connections are not safe to
+    share. These assert both halves of that.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from pipeline import scoring
+        from pipeline.stages import score as score_stage
+
+        self.score_stage = score_stage
+        self.scoring = scoring
+        source = self.add_source()
+        self.shot_ids = [
+            self.add_shot(source, scored=False, tagged=False) for _ in range(12)
+        ]
+
+    def fake_scorer(self, record=None):
+        """Deterministic per-shot scores, derived from the shot's in_point."""
+        def score_shot(row, cfg, aesthetic):
+            if record is not None:
+                record.append(threading.current_thread().name)
+            value = round(0.5 + row["in_point"] / 1000, 4)
+            return self.scoring.Scores(
+                motion=value, stability=value, technical=value, aesthetic=None
+            )
+        return score_shot
+
+    def scores_in_db(self):
+        return {
+            row["id"]: row["motion_score"]
+            for row in self.conn.execute(
+                "SELECT id, motion_score FROM shots ORDER BY id"
+            ).fetchall()
+        }
+
+    def test_parallel_matches_serial(self):
+        with mock.patch.object(self.score_stage, "score_shot", self.fake_scorer()):
+            self.score_stage.score_pending(self.conn, self.cfg, workers=4)
+        parallel = self.scores_in_db()
+
+        with db.transaction(self.conn):
+            for shot_id in self.shot_ids:
+                db.update_shot(self.conn, shot_id, scored_at=None, motion_score=None)
+        with mock.patch.object(self.score_stage, "score_shot", self.fake_scorer()):
+            self.score_stage.score_pending(self.conn, self.cfg, workers=1)
+
+        self.assertEqual(parallel, self.scores_in_db())
+
+    def test_every_shot_is_scored_exactly_once(self):
+        with mock.patch.object(self.score_stage, "score_shot", self.fake_scorer()):
+            counts = self.score_stage.score_pending(self.conn, self.cfg, workers=4)
+        self.assertEqual(counts["scored"], len(self.shot_ids))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT count(*) FROM shots WHERE scored_at IS NULL"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_work_really_runs_on_worker_threads(self):
+        seen: list[str] = []
+        with mock.patch.object(self.score_stage, "score_shot", self.fake_scorer(seen)):
+            self.score_stage.score_pending(self.conn, self.cfg, workers=4)
+        self.assertGreater(len(set(seen)), 1, "expected more than one worker thread")
+
+    def test_database_writes_stay_on_the_calling_thread(self):
+        """A write from a worker thread would raise ProgrammingError under
+        SQLite's default check_same_thread, intermittently."""
+        main_thread = threading.current_thread().name
+        writing_threads: list[str] = []
+        original = db.update_shot
+
+        def spy(conn, shot_id, **values):
+            writing_threads.append(threading.current_thread().name)
+            return original(conn, shot_id, **values)
+
+        with mock.patch.object(self.score_stage, "score_shot", self.fake_scorer()), \
+             mock.patch.object(self.score_stage.db, "update_shot", spy):
+            self.score_stage.score_pending(self.conn, self.cfg, workers=4)
+
+        self.assertTrue(writing_threads)
+        self.assertEqual(set(writing_threads), {main_thread})
+
+    def test_one_failure_does_not_stall_the_pool(self):
+        def flaky(row, cfg, aesthetic):
+            if row["id"] == self.shot_ids[3]:
+                raise RuntimeError("unreadable file")
+            return self.scoring.Scores(motion=0.5, stability=0.5, technical=0.5)
+
+        with mock.patch.object(self.score_stage, "score_shot", flaky):
+            counts = self.score_stage.score_pending(self.conn, self.cfg, workers=4)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["scored"], len(self.shot_ids) - 1)
+
+    def test_nothing_to_do_is_cheap(self):
+        with db.transaction(self.conn):
+            for shot_id in self.shot_ids:
+                db.update_shot(self.conn, shot_id, scored_at="2026-01-01")
+        with mock.patch.object(self.score_stage, "score_shot") as scorer:
+            counts = self.score_stage.score_pending(self.conn, self.cfg, workers=4)
+        scorer.assert_not_called()
+        self.assertEqual(counts, {"scored": 0, "failed": 0})

@@ -20,6 +20,16 @@ log = logging.getLogger(__name__)
 Segment = tuple[float, float]
 
 
+def _seconds(timecode) -> float:
+    """Read a PySceneDetect timecode across versions.
+
+    0.7 exposes a `seconds` property and deprecates `get_seconds()`; 0.6 only
+    has the method.
+    """
+    value = getattr(timecode, "seconds", None)
+    return float(value) if value is not None else float(timecode.get_seconds())
+
+
 def merge_short_segments(segments: list[Segment], min_seconds: float) -> list[Segment]:
     """Absorb segments below the minimum into the neighbour they came from.
 
@@ -72,7 +82,7 @@ def detect_segments(
     if not scenes:
         return [(0.0, duration)]
 
-    segments = [(start.get_seconds(), end.get_seconds()) for start, end in scenes]
+    segments = [(_seconds(start), _seconds(end)) for start, end in scenes]
     # Detection can stop short of the container duration; keep the tail.
     if duration - segments[-1][1] > 0.5:
         segments[-1] = (segments[-1][0], duration)
