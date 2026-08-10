@@ -141,6 +141,63 @@ where the filesystem allows it — a second name for the same bytes, costing no
 extra disk. It falls back to a copy on external or network drives that don't
 support links, and deleting an export never touches the render.
 
+## What happens to a file holding more than one usable shot
+
+This is the normal case for drone footage, and it is what Stage 1b exists for.
+A single continuous recording typically holds a good move, a fast reposition to
+find the next composition, then another good move. None of those transitions is
+a *cut*, so scene detection alone cannot see them — and a file left whole gets
+scored as the average of its best and worst parts, which usually puts it under
+the bar and discards the good footage along with the bad.
+
+So each scene is also split by **what the camera is doing**:
+
+```
+DJI_0042.MP4  (one continuous 10s recording)
+   0.00 ->  4.12  move         usable
+   4.12 ->  6.12  reposition   REJECTED — camera searching, not composed
+   6.12 -> 10.00  move         usable
+```
+
+Two shots go forward and get scored, tagged, and rendered independently. The
+repositioning is flagged, **never deleted** — the seconds stay addressable in
+case the bar moves later. Every second of the source lands in exactly one shot.
+
+Camera movement is measured by phase correlation, which finds the single
+dominant shift between frames. That matters for two reasons that only showed up
+against real footage:
+
+- **It measures the camera, not the contents.** Mean optical flow is dragged
+  around by anything moving *inside* the frame, so a locked-off shot over water
+  or foliage reads as chaotic and gets thrown out. Phase correlation reads the
+  camera as parked: measured 0.00px with a subject crossing frame, 0.02px over
+  moving water.
+- **It stays honest at speed.** Optical flow silently under-reports
+  displacements it cannot track — a frantic 1200px/s reposition measured a
+  *lower* apparent speed than a 40px/s pan, so classifying on it would have
+  ranked the worst footage as the calmest.
+
+What separates a deliberate move from searching is not speed but whether the
+movement doubles back on itself (`jitter`): pans measured 0.00 at every speed
+tested, repositioning 0.43, aimless oscillation 0.59.
+
+| Camera | Verdict |
+|---|---|
+| Locked off — including over moving water or a passing subject | `held`, usable |
+| Pan, push-in, slide at any steady speed | `move`, usable |
+| Searching for the next composition | `reposition`, rejected |
+| Whip-pan above `MOTION_MAX_RATE` | `reposition`, rejected |
+
+Tunable: `MIN_REPOSITION_SECONDS` (default 1.0) is how long searching must last
+before it's worth cutting out — below that it's a wobble mid-move and gets
+absorbed rather than splitting a good shot in two. `MOTION_SEGMENTATION=0`
+turns the whole pass off and cuts only on hard cuts.
+
+One honest limitation: how fast a move can be before it stops being trackable
+depends on the sampling rate, so a genuinely fast whip-pan is classified as
+repositioning. For an archive feeding held-shot and slow-reveal formats that
+bias is the right way round, but it is a bias, not a measurement.
+
 ## What Stage 2 actually measures
 
 The stability score is the one Stage 2 leans on, so it's validated against

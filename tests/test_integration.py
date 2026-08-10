@@ -15,7 +15,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from pipeline import db, media, render
+from pipeline import db, media, motion, render
 from pipeline.config import config as base_config
 from pipeline.stages import export_catalog, ingest, scene_detect, select_render
 
@@ -472,3 +472,165 @@ class TestRealSceneDetection(IntegrationTestCase):
         self.assertAlmostEqual(segments[-1][1], 9.0, delta=0.2)
         for (_, end), (start, _) in zip(segments, segments[1:]):
             self.assertEqual(end, start)
+
+
+@unittest.skipUnless(HAS_FFMPEG and HAS_CV2, "ffmpeg or opencv missing")
+class TestMotionAgainstKnownCameraMoves(IntegrationTestCase):
+    """Measure real footage whose camera speed we chose.
+
+    The unit tests assert the logic; these assert the measurement — that a
+    given camera behaviour produces the numbers the thresholds assume.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._plate_dir = tempfile.TemporaryDirectory()
+        plate = Path(cls._plate_dir.name) / "plate.png"
+        # Blurred noise: rich, non-repeating detail at the scale correlation
+        # locks onto. A synthetic test pattern correlates too poorly to measure.
+        rng = np.random.default_rng(11)
+        image = cv2.GaussianBlur(
+            rng.integers(0, 255, (2160, 3840), dtype=np.uint8), (9, 9), 0
+        )
+        cv2.imwrite(str(plate), cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX))
+        cls.plate = plate
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._plate_dir.cleanup()
+
+    def fly(self, name: str, crop: str, seconds: int = 4, extra: str = "") -> Path:
+        out = self.root / f"{name}.mp4"
+        chain = f"crop=640:360:{crop}" + (f",{extra}" if extra else "")
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-loop", "1", "-i", str(self.plate), "-t", str(seconds), "-r", "30",
+                "-vf", chain, "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out),
+            ],
+            check=True, capture_output=True,
+        )
+        return out
+
+    def profile(self, clip: Path, seconds: float = 4.0):
+        from pipeline.stages.scene_detect import profile_motion
+
+        samples, width = profile_motion(clip, 0.0, seconds, self.cfg)
+        return motion.summarise(samples), width
+
+    def verdict(self, clip: Path, seconds: float = 4.0) -> str:
+        window, width = self.profile(clip, seconds)
+        return motion.classify(window, width, self.cfg.motion_sample_fps)
+
+    # -- the camera is still -------------------------------------------------
+
+    def test_locked_off_shot_is_held(self):
+        self.assertEqual(self.verdict(self.fly("held", "x=1600:y=900")), motion.HELD)
+
+    def test_subject_crossing_frame_does_not_move_the_camera(self):
+        clip = self.fly(
+            "subject", "x=1600:y=900",
+            extra="drawbox=x='50+t*140':y=120:w=90:h=90:color=black@1:t=fill",
+        )
+        self.assertEqual(self.verdict(clip), motion.HELD)
+
+    def test_moving_water_does_not_read_as_repositioning(self):
+        """The false positive that would discard a good held shot: mean optical
+        flow calls this chaotic, phase correlation reads the camera as parked."""
+        clip = self.fly("water", "x=1600:y=900", extra="noise=alls=45:allf=t+u")
+        self.assertEqual(self.verdict(clip), motion.HELD)
+
+    # -- the camera moves deliberately ---------------------------------------
+
+    def test_slow_pan_is_usable(self):
+        self.assertEqual(self.verdict(self.fly("slow", "x='1600+t*40':y=900")), motion.MOVE)
+
+    def test_medium_pan_is_usable(self):
+        self.assertEqual(self.verdict(self.fly("medium", "x='1600+t*150':y=900")), motion.MOVE)
+
+    def test_measured_speed_tracks_actual_speed(self):
+        """Optical flow under-reported fast motion so badly that a 1200 px/s
+        reposition measured slower than a 40 px/s pan."""
+        slow, _ = self.profile(self.fly("s1", "x='1600+t*40':y=900"))
+        medium, _ = self.profile(self.fly("s2", "x='1600+t*150':y=900"))
+        fast, _ = self.profile(self.fly("s3", "x='1600+t*400':y=900"))
+        self.assertLess(slow.shift, medium.shift)
+        self.assertLess(medium.shift, fast.shift)
+
+    def test_measured_speed_is_proportional(self):
+        """150 px/s should measure about four times 40 px/s."""
+        slow, _ = self.profile(self.fly("p1", "x='1600+t*40':y=900"))
+        medium, _ = self.profile(self.fly("p2", "x='1600+t*150':y=900"))
+        self.assertAlmostEqual(medium.shift / slow.shift, 150 / 40, delta=0.6)
+
+    # -- the camera is searching ---------------------------------------------
+
+    def test_reposition_is_rejected(self):
+        clip = self.fly(
+            "repo", "x='1600+t*1200':y=900",
+        )
+        window, width = self.profile(clip)
+        self.assertGreater(window.jitter, motion.JITTER)
+        self.assertEqual(
+            motion.classify(window, width, self.cfg.motion_sample_fps),
+            motion.REPOSITION,
+        )
+
+    def test_oscillating_search_is_rejected(self):
+        clip = self.fly("osc", "x='1600+300*sin(t*6)':y='900+200*cos(t*7)'")
+        self.assertEqual(self.verdict(clip), motion.REPOSITION)
+
+    def test_deliberate_moves_have_no_jitter(self):
+        for name, speed in (("j1", 40), ("j2", 150), ("j3", 400)):
+            window, _ = self.profile(self.fly(name, f"x='1600+t*{speed}':y=900"))
+            self.assertLess(window.jitter, motion.JITTER, f"{speed} px/s")
+
+    # -- putting it together -------------------------------------------------
+
+    def test_one_file_two_usable_shots(self):
+        """A file holding a good move, a reposition, then another good move
+        becomes two usable shots and one flagged one — not a single shot whose
+        score is the average of all three."""
+        clip = self.fly(
+            "multi",
+            "x='if(lt(t,4), 200+t*40, if(lt(t,6), 360+(t-4)*900+120*sin((t-4)*25),"
+            " 2160+(t-6)*40))'"
+            ":y='if(lt(t,4), 900, if(lt(t,6), 900+300*sin((t-4)*18), 900))'",
+            seconds=10,
+        )
+        segments = scene_detect.split_by_motion(clip, [(0.0, 10.0)], self.cfg)
+        classes = [motion_class for _, _, motion_class in segments]
+        self.assertEqual(classes.count(motion.REPOSITION), 1)
+        self.assertEqual(len([c for c in classes if c in motion.USABLE]), 2)
+
+        # The reposition lands where it actually is, and the timeline is whole.
+        reposition = next(s for s in segments if s[2] == motion.REPOSITION)
+        self.assertAlmostEqual(reposition[0], 4.0, delta=0.6)
+        self.assertAlmostEqual(reposition[1], 6.0, delta=0.6)
+        self.assertEqual(segments[0][0], 0.0)
+        self.assertEqual(segments[-1][1], 10.0)
+        for (_, end, _), (start, _, _) in zip(segments, segments[1:]):
+            self.assertEqual(end, start)
+
+    def test_repositioning_is_flagged_not_deleted(self):
+        clip = self.cfg.archive_root / "albania/DJI_MULTI.MP4"
+        clip.parent.mkdir(parents=True, exist_ok=True)
+        self.fly("tmp", "x='if(lt(t,4), 200+t*40, if(lt(t,6),"
+                 " 360+(t-4)*900+120*sin((t-4)*25), 2160+(t-6)*40))'"
+                 ":y='if(lt(t,4), 900, if(lt(t,6), 900+300*sin((t-4)*18), 900))'",
+                 seconds=10).rename(clip)
+
+        ingest.run(self.conn, self.cfg)
+        counts = scene_detect.run(self.conn, self.cfg)
+        self.assertEqual(counts["reposition"], 1)
+        self.assertEqual(counts["usable"], 2)
+
+        rows = self.conn.execute(
+            "SELECT * FROM shots ORDER BY in_point"
+        ).fetchall()
+        rejected = [r for r in rows if r["rejected"]]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["motion_class"], motion.REPOSITION)
+        self.assertIn("reposition", rejected[0]["reject_reason"])
+        # Flagged, never deleted: the footage stays addressable.
+        self.assertEqual(len(rows), 3)

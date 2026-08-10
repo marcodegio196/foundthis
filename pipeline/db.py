@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 # Bumped when schema.sql changes in a way that needs a migration step.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Columns stored as JSON text. Read helpers decode them; write helpers encode.
 JSON_COLUMNS = frozenset(
@@ -34,6 +34,9 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE shots ADD COLUMN zernio_post_id TEXT",
         "ALTER TABLE shots ADD COLUMN delivery_status TEXT",
         "ALTER TABLE shots ADD COLUMN delivery_checked_at TEXT",
+    ),
+    3: (
+        "ALTER TABLE shots ADD COLUMN motion_class TEXT",
     ),
 }
 
@@ -152,27 +155,34 @@ def upsert_source(conn: sqlite3.Connection, **values: Any) -> int:
 
 
 def replace_shots(
-    conn: sqlite3.Connection, source_id: int, segments: Sequence[tuple[float, float]]
+    conn: sqlite3.Connection,
+    source_id: int,
+    segments: Sequence[tuple[float, float] | tuple[float, float, str]],
 ) -> list[int]:
     """Write the shot list for a source, replacing any previous detection.
 
-    Re-running scene detection with different thresholds is expected, so this
-    clears the source's existing shots first. That discards downstream state for
-    those shots by design — the segments they described no longer exist.
+    Segments are `(in, out)` or `(in, out, motion_class)`.
+
+    Re-running detection with different thresholds is expected, so this clears
+    the source's existing shots first. That discards downstream state for those
+    shots by design — the segments they described no longer exist.
     """
     with transaction(conn):
         conn.execute("DELETE FROM shots WHERE source_id = ?", (source_id,))
         shot_ids: list[int] = []
-        for index, (in_point, out_point) in enumerate(segments):
+        for index, segment in enumerate(segments):
+            in_point, out_point = segment[0], segment[1]
+            motion_class = segment[2] if len(segment) > 2 else None
             cursor = conn.execute(
                 "INSERT INTO shots (source_id, shot_index, in_point, out_point, "
-                "continuous_move) VALUES (?, ?, ?, ?, ?)",
+                "continuous_move, motion_class) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     source_id,
                     index,
                     in_point,
                     out_point,
                     1 if len(segments) == 1 else 0,
+                    motion_class,
                 ),
             )
             shot_ids.append(int(cursor.lastrowid))
@@ -256,6 +266,11 @@ def stats(conn: sqlite3.Connection) -> dict[str, int]:
             "SELECT count(*) FROM sources WHERE scene_detected_at IS NULL"
         ),
         "shots": scalar("SELECT count(*) FROM shots"),
+        "held": scalar("SELECT count(*) FROM shots WHERE motion_class = 'held'"),
+        "moving": scalar("SELECT count(*) FROM shots WHERE motion_class = 'move'"),
+        "repositioning": scalar(
+            "SELECT count(*) FROM shots WHERE motion_class = 'reposition'"
+        ),
         "scored": scalar("SELECT count(*) FROM shots WHERE scored_at IS NOT NULL"),
         "rejected": scalar("SELECT count(*) FROM shots WHERE rejected = 1"),
         "tagged": scalar("SELECT count(*) FROM shots WHERE tagged_at IS NOT NULL"),

@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS shots (
     duration          REAL GENERATED ALWAYS AS (out_point - in_point) VIRTUAL,
     continuous_move   INTEGER NOT NULL DEFAULT 0,-- 1 = file kept whole, no cut found
 
+    -- What the camera is doing here: 'held' (locked off), 'move' (a deliberate
+    -- pan, push, or slide), or 'reposition' (searching for the next
+    -- composition). Repositioning is flagged rejected on creation.
+    motion_class      TEXT,
+
     -- ---------------------------------------------------------------------
     -- Stage 2 — score & filter
     -- ---------------------------------------------------------------------

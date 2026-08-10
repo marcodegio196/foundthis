@@ -44,6 +44,22 @@ class Config:
     scene_threshold: float = _float("SCENE_THRESHOLD", 32.0)
     min_shot_seconds: float = _float("MIN_SHOT_SECONDS", 3.0)
 
+    # Split each scene by what the camera is doing, so a file holding two good
+    # moves either side of a reposition becomes two usable shots rather than one
+    # averaged-out shot. Set MOTION_SEGMENTATION=0 to cut only on hard cuts.
+    motion_segmentation: bool = os.environ.get("MOTION_SEGMENTATION", "1") not in ("0", "false", "")
+    # Sampling rate for the profile. Higher tracks faster movement but costs a
+    # decode per sample across the whole archive.
+    motion_sample_fps: float = _float("MOTION_SAMPLE_FPS", 4.0)
+    motion_max_frames: int = _int("MOTION_MAX_FRAMES", 600)
+    # A reposition only has to last about a second to be worth cutting out;
+    # judging it by min_shot_seconds would fold it back into the shot beside it.
+    min_reposition_seconds: float = _float("MIN_REPOSITION_SECONDS", 1.0)
+    # Speed ceiling in frame widths per second: above this a move is too fast
+    # to hold a composition even if it runs perfectly straight. Generous by
+    # default — the jitter test does most of the work.
+    motion_max_rate: float = _float("MOTION_MAX_RATE", 1.0)
+
     # Stage 2 — bottom percentile is flagged, never deleted.
     reject_percentile: float = _float("REJECT_PERCENTILE", 0.35)
     sample_fps: float = _float("SAMPLE_FPS", 1.0)

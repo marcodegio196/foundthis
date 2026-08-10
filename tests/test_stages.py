@@ -199,26 +199,26 @@ class TestSceneDetect(StageTestCase):
         with mock.patch.object(
             scene_detect, "detect_segments", return_value=[(0.0, 12.0), (12.0, 30.0)]
         ):
-            counts = scene_detect.run(self.conn, self.cfg)
+            counts = scene_detect.run(self.conn, self.cfg, profile=False)
         self.assertEqual((counts["sources"], counts["shots"]), (1, 2))
         self.assertEqual(db.sources_pending_scene_detection(self.conn), [])
 
     def test_single_segment_marked_continuous(self):
         self.add_source()
         with mock.patch.object(scene_detect, "detect_segments", return_value=[(0.0, 30.0)]):
-            counts = scene_detect.run(self.conn, self.cfg)
+            counts = scene_detect.run(self.conn, self.cfg, profile=False)
         self.assertEqual(counts["continuous"], 1)
 
     def test_detector_failure_leaves_source_pending(self):
         self.add_source()
         with mock.patch.object(scene_detect, "detect_segments", side_effect=RuntimeError):
-            counts = scene_detect.run(self.conn, self.cfg)
+            counts = scene_detect.run(self.conn, self.cfg, profile=False)
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(len(db.sources_pending_scene_detection(self.conn)), 1)
 
     def test_source_without_duration_skipped(self):
         self.add_source(duration=None)
-        counts = scene_detect.run(self.conn, self.cfg)
+        counts = scene_detect.run(self.conn, self.cfg, profile=False)
         self.assertEqual(counts["failed"], 1)
 
 
