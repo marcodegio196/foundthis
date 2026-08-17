@@ -11,7 +11,7 @@
 
 - Walk the archive, register every source file (ffprobe: duration, resolution, codec, aspect, creation date, embedded GPS).
 - Content-aware scene detection splits each file into shots (`in_point`/`out_point`), or keeps it as one shot if it's a continuous move — common for drone footage.
-- Folder convention (`archive/country/file`) auto-fills `country`; `site` stays blank for now.
+- Folder convention (`input/country/file`) auto-fills `country`; `site` stays blank for now.
 
 *Status: built (`01_ingest.py`, `02_scene_detect.py`), tested — not yet committed to this repo.*
 

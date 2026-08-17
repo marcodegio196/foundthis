@@ -19,7 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .. import db, media, scoring
+from .. import db, media, motion, scoring
 from ..aesthetic import AestheticScorer, load_scorer, null_scorer
 from ..config import Config, config as default_config
 
@@ -196,10 +196,20 @@ def apply_rejections(
     Recomputed from scratch every run: previously rejected shots are cleared
     first, so lowering the bar genuinely brings footage back rather than
     requiring a rescore.
+
+    Repositioning is excluded throughout. That rejection comes from stage 1b and
+    describes what the camera was doing, not how the footage scored, so clearing
+    it here would quietly hand the jerk between two good moves back to the
+    selection queue. Excluding it from the population matters too: a reposition
+    has no motion or stability score, so it would otherwise be ranked on
+    technical quality alone — and a sharp, well-exposed frame of the camera
+    searching scores *above* the bar.
     """
     rows = conn.execute(
         "SELECT id, motion_score, stability_score, technical_score, aesthetic_score "
-        "FROM shots WHERE scored_at IS NOT NULL"
+        "FROM shots WHERE scored_at IS NOT NULL "
+        "AND (motion_class IS NULL OR motion_class != ?)",
+        (motion.REPOSITION,),
     ).fetchall()
     if not rows:
         return {"considered": 0, "rejected": 0, "threshold": None}
@@ -241,7 +251,9 @@ def apply_rejections(
 
     with db.transaction(conn):
         conn.execute(
-            "UPDATE shots SET rejected = 0, reject_reason = NULL WHERE scored_at IS NOT NULL"
+            "UPDATE shots SET rejected = 0, reject_reason = NULL "
+            "WHERE scored_at IS NOT NULL AND (motion_class IS NULL OR motion_class != ?)",
+            (motion.REPOSITION,),
         )
     db.reject(conn, below, f"bottom {cfg.reject_percentile:.0%} (< {threshold:.3f})")
     for shot_id, reason in floor_failures.items():

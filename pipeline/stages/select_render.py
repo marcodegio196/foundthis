@@ -12,7 +12,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from .. import db, layout, media, render
+from .. import db, layout, media, motion, render
 from ..config import Config, config as default_config
 
 log = logging.getLogger(__name__)
@@ -109,6 +109,19 @@ def overlay_for(row: db.Row, cfg: Config = default_config) -> list[str]:
     return render.overlay_lines(year, row["country"], row["site"], cfg.overlay_text)
 
 
+def clip_bounds(row: db.Row, cfg: Config = default_config) -> tuple[float, float]:
+    """In and out points for a render, after applying the length ceiling.
+
+    Trimming rather than skipping is deliberate: a long held shot is usually
+    good footage that simply outruns the format, and the opening seconds are the
+    composed ones — the tail is where the drone starts drifting off.
+    """
+    in_point, out_point = row["in_point"], row["out_point"]
+    if cfg.max_render_seconds > 0:
+        out_point = min(out_point, in_point + cfg.max_render_seconds)
+    return in_point, out_point
+
+
 def render_shot(
     conn: sqlite3.Connection,
     row: db.Row,
@@ -118,6 +131,7 @@ def render_shot(
 ) -> dict[str, str]:
     """Render one approved shot into the requested profiles."""
     written: dict[str, str] = {}
+    in_point, out_point = clip_bounds(row, cfg)
 
     def target_for(root: Path) -> Path:
         return layout.render_path(
@@ -136,7 +150,7 @@ def render_shot(
         media.run(
             render.build_social_command(
                 row["source_path"], target,
-                in_point=row["in_point"], out_point=row["out_point"],
+                in_point=in_point, out_point=out_point,
                 width=row["source_width"] or 0, height=row["source_height"] or 0,
                 lines=lines,
                 font_file=cfg.overlay_font,
@@ -151,22 +165,27 @@ def render_shot(
         media.run(
             render.build_licensing_command(
                 row["source_path"], target,
-                in_point=row["in_point"], out_point=row["out_point"],
+                in_point=in_point, out_point=out_point,
                 codec=cfg.licensing_codec,
             ),
             capture=True,
         )
         written["licensing"] = str(target)
 
+    # Only record the profiles this run actually wrote. Passing None for the
+    # other one would clear a path that is still on disk, so `render --profiles
+    # social` would silently lose the licensing master it never touched.
+    updates: dict[str, object] = {
+        "overlay_text": " / ".join(overlay_for(row, cfg)),
+        "rendered_at": db.now(),
+    }
+    if "social" in written:
+        updates["social_render_path"] = written["social"]
+    if "licensing" in written:
+        updates["licensing_render_path"] = written["licensing"]
+
     with db.transaction(conn):
-        db.update_shot(
-            conn,
-            row["id"],
-            social_render_path=written.get("social"),
-            licensing_render_path=written.get("licensing"),
-            overlay_text=" / ".join(overlay_for(row, cfg)),
-            rendered_at=db.now(),
-        )
+        db.update_shot(conn, row["id"], **updates)
     return written
 
 
@@ -184,8 +203,25 @@ def run(
         + (f" LIMIT {int(limit)}" if limit else "")
     ).fetchall()
 
-    counts = {"rendered": 0, "failed": 0}
+    counts = {"rendered": 0, "skipped_short": 0, "skipped_jerk": 0, "failed": 0}
     for row in rows:
+        # Repositioning never renders, however it was approved. A jerk that
+        # reached the queue is an upstream mistake, not something to burn an
+        # overlay onto and post.
+        if row["motion_class"] == motion.REPOSITION:
+            log.info("shot %s skipped: repositioning", row["id"])
+            counts["skipped_jerk"] += 1
+            continue
+
+        in_point, out_point = clip_bounds(row, cfg)
+        if cfg.min_render_seconds > 0 and (out_point - in_point) < cfg.min_render_seconds:
+            log.info(
+                "shot %s skipped: %.2fs is under MIN_RENDER_SECONDS=%.2f",
+                row["id"], out_point - in_point, cfg.min_render_seconds,
+            )
+            counts["skipped_short"] += 1
+            continue
+
         try:
             written = render_shot(conn, row, cfg, profiles=profiles)
         except media.MediaError as exc:

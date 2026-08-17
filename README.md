@@ -8,9 +8,12 @@ Five stages, run in order, all sharing one SQLite database. Raw footage is never
 modified — the database accumulates metadata and state as a shot moves through.
 
 ```
-archive/ ──▶ 1 ingest & segment ──▶ 2 score & filter ──▶ 3 tag & describe ──┬──▶ 4 render social ──▶ 5 post via Zernio
-                                                                            └──▶ 4 render master ──▶ 5 licensing upload
+input/ ──▶ 1 ingest & segment ──▶ 2 score & filter ──▶ 3 tag & describe ──┬──▶ 4 render social ──▶ 5 post via Zernio
+                                                                          └──▶ 4 render master ──▶ 5 licensing upload
 ```
+
+Raw footage goes in `input/`, renders come out in `output/social` (9:16 with the
+overlay burned in) and `output/licensing` (the same footage, clean).
 
 Full design: [`docs/architecture.md`](docs/architecture.md).
 
@@ -69,9 +72,14 @@ Configuration is environment-driven, so the same code runs against the real
 archive or a small test folder:
 
 ```bash
-export ARCHIVE_ROOT=/Volumes/drone/archive   # expects archive/<country>/<file>
+export ARCHIVE_ROOT=./input                  # expects input/<country>/<file>
 export PIPELINE_DB=./pipeline.db
-export RENDER_ROOT=./renders
+export RENDER_ROOT=./output                  # -> output/social, output/licensing
+
+# Stage 4 — clip length bounds in seconds; 0 disables either end. A shorter
+# shot is skipped, a longer one is trimmed to the ceiling from its in-point.
+export MIN_RENDER_SECONDS=3
+export MAX_RENDER_SECONDS=15
 
 # Stage 3
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -111,13 +119,13 @@ The database layer and CLI deliberately need neither.
 ## Everything stays on local disk
 
 Raw footage is never written to, moved, or deleted — the pipeline only reads it.
-Renders and exports go into their own trees, mirroring the `archive/<country>/`
+Renders and exports go into their own trees, mirroring the `input/<country>/`
 convention so they're browsable in Explorer without opening the database:
 
 ```
-archive/albania/DJI_0001.MP4              # untouched, read-only
-renders/social/albania/2024/000012_dji_0001_ksamil.mp4
-renders/licensing/albania/2024/000012_dji_0001_ksamil.mp4
+input/albania/DJI_0001.MP4                # untouched, read-only
+output/social/albania/2024/000012_dji_0001_ksamil.mp4
+output/licensing/albania/2024/000012_dji_0001_ksamil.mp4
 exports/non-exclusive/albania/2024/000012_dji_0001_ksamil.mp4
 exports/non-exclusive/albania/2024/000012_dji_0001_ksamil.json
 exports/non-exclusive/manifest.csv

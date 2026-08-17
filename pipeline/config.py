@@ -34,7 +34,10 @@ def _int(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Config:
     # Stage 1
-    archive_root: Path = _path("ARCHIVE_ROOT", "./archive")
+    # Raw footage in, renders out. `input/<country>/<file>` — the country folder
+    # is what stage 1 reads the country from, so files dropped in the root sort
+    # to "unknown-country".
+    archive_root: Path = _path("ARCHIVE_ROOT", "./input")
     db_path: Path = _path("PIPELINE_DB", "./pipeline.db")
     video_extensions: tuple[str, ...] = (".mp4", ".mov", ".mxf", ".insv")
 
@@ -69,7 +72,13 @@ class Config:
     # the limit, not the CPU.
     score_workers: int = _int("SCORE_WORKERS", min(8, (os.cpu_count() or 2)))
 
-    # Stage 4
+    # Stage 4 — bounds on the length of a rendered clip, in seconds. 0 disables
+    # either end. A shot shorter than the minimum is not rendered at all; one
+    # longer than the maximum is trimmed to it from the in-point, so a good
+    # 40-second hold still yields a postable clip rather than being skipped.
+    min_render_seconds: float = _float("MIN_RENDER_SECONDS", 0.0)
+    max_render_seconds: float = _float("MAX_RENDER_SECONDS", 0.0)
+
     render_root: Path = _path("RENDER_ROOT", "./renders")
     overlay_text: str = os.environ.get("OVERLAY_TEXT", "Found this.")
     # ffmpeg's drawtext needs an explicit font file on most Linux builds; on

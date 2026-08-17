@@ -15,8 +15,16 @@ venv/
 
 # Rendered output and working files
 renders/
+output/
 work/
 *.log
+
+# Raw footage — read-only source, never belongs in git
+input/
+archive/
+*.MP4
+*.mp4
+*.mov
 
 .DS_Store
 .idea/
