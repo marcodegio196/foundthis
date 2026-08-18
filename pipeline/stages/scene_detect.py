@@ -112,7 +112,17 @@ def profile_motion(
     if len(timestamps) < 2:
         return [], 0
     with tempfile.TemporaryDirectory(prefix="motion-") as tmp:
-        frames = media.extract_frames(path, timestamps, tmp, width=512)
+        # 256px, matching `media.iter_gray_frames`. Phase correlation needs a
+        # clean peak, and specular sparkle on water is high-frequency noise that
+        # buries it: measured over a sunlit sea, confidence at 512px was 0.09 —
+        # under MIN_RESPONSE — so a steady move (jitter 0.03) was read as
+        # "too chaotic to correlate" and rejected as repositioning. Decimating
+        # to 256px is a low-pass that removes the sparkle and not the features:
+        # confidence 0.09 -> 0.21 on water, 0.30 -> 0.54 on rock, with the
+        # measured shift unchanged. Gaussian blur does not work here — it smears
+        # the structure the correlation needs and inflates jitter to 0.68, and
+        # 384/320px leave the water still misclassified.
+        frames = media.extract_frames(path, timestamps, tmp, width=256)
         # A frame that failed to extract shifts every later timestamp, so only
         # measure when the two line up.
         if len(frames) != len(timestamps):
