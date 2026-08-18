@@ -75,6 +75,36 @@ MAX_RATE = 1.0
 # as held is the safe reading, since there is no evidence of movement.
 MIN_RESPONSE = 0.15
 
+# --- Speed steadiness -------------------------------------------------------
+#
+# `jitter` asks whether the camera holds its *direction*. It says nothing about
+# whether it holds its *speed*, and a move that stops dead and restarts keeps a
+# constant heading throughout — so a clean-looking shot can contain a lurch that
+# every existing measure reads as perfect. Three real examples, all with jitter
+# under 0.03 and stability above 0.4:
+#
+#   a pan that stops for 0.23s mid-move and resumes
+#   a 15s take whose speed collapses 73% in the second second, then recovers
+#   a steady shot that steps up 52% in speed halfway through
+#
+# What separates those from good footage is not how much the speed changes but
+# whether the change *reverses*. A deliberate ease ramps one way; a lurch dips
+# and comes back. Measured over the judged clips: three bad shots scored 1-3
+# reversals, the good one scored 0 despite an 18x speed range.
+
+# Below this the camera is parked and relative changes are noise, not movement.
+# In frame widths per second, the same units as HELD_RATE — a raw pixel figure
+# would silently mean something different at another sampling rate, and the
+# profile has to stay comparable across an archive shot at mixed resolutions.
+SPEED_FLOOR = HELD_RATE
+
+# Relative speed change worth noticing between one second and the next.
+SPEED_MIN_CHANGE = 0.30
+
+# Bucket width for the speed curve. A second is long enough to average out
+# per-frame correlation noise and short enough to resolve a stop-and-go.
+SPEED_BUCKET_SECONDS = 1.0
+
 
 @dataclass(frozen=True)
 class Sample:
@@ -264,6 +294,83 @@ def merge_short_runs(
     return collapsed
 
 
+def speed_buckets(
+    samples: Sequence[Sample],
+    sample_fps: float,
+    frame_width: int,
+    *,
+    bucket_seconds: float = SPEED_BUCKET_SECONDS,
+) -> list[float]:
+    """The shot's speed curve, one value per bucket, in frame widths per second.
+
+    Stage 1b already measures every sample this needs, so building it costs no
+    extra decode — which is what makes it affordable across a 250GB archive.
+
+    Values are rates rather than raw pixels so the curve means the same thing
+    at any resolution or sampling rate: a stored profile stays comparable when
+    the archive mixes 1080p and 4K, and the thresholds do not quietly move if
+    MOTION_SAMPLE_FPS is retuned.
+    """
+    if frame_width <= 0 or sample_fps <= 0:
+        return []
+    per = max(1, int(round(sample_fps * bucket_seconds)))
+    out: list[float] = []
+    for index in range(0, len(samples) - per + 1, per):
+        chunk = samples[index : index + per]
+        shift = sum(s.distance for s in chunk) / len(chunk)
+        out.append((shift * sample_fps) / frame_width)
+    return out
+
+
+def speed_reversals(
+    buckets: Sequence[float],
+    *,
+    floor: float = SPEED_FLOOR,
+    min_change: float = SPEED_MIN_CHANGE,
+) -> int:
+    """How many times the speed curve changes direction.
+
+    Small wobbles and near-static stretches are ignored, so what remains is the
+    stop-and-go: speed falling far enough to see, then climbing back. A single
+    deliberate acceleration or deceleration returns 0 however large it is.
+    """
+    count, direction, anchor = 0, 0, None
+    for value in buckets:
+        if anchor is None:
+            anchor = value
+            continue
+        if max(anchor, value) < floor:
+            anchor = value
+            continue
+        change = (value - anchor) / max(anchor, floor)
+        if abs(change) < min_change:
+            continue
+        new_direction = 1 if change > 0 else -1
+        if direction and new_direction != direction:
+            count += 1
+        direction, anchor = new_direction, value
+    return count
+
+
+def speed_spread(buckets: Sequence[float], *, floor: float = SPEED_FLOOR) -> float:
+    """Ratio of fastest to slowest second. 1.0 is metronomic."""
+    if not buckets:
+        return 1.0
+    fastest, slowest = max(buckets), min(buckets)
+    return fastest / max(slowest, floor) if fastest > 0 else 1.0
+
+
+def eases_in(buckets: Sequence[float], *, floor: float = SPEED_FLOOR) -> bool:
+    """Did the shot start from rest?
+
+    An acceleration out of a hover is a reveal and reads as deliberate. The same
+    acceleration from an existing cruise reads as the drone departing. Without
+    this exemption the spread test rejects legitimate slow reveals, which
+    measured an 18x speed range while being the best clip in the set.
+    """
+    return bool(buckets) and buckets[0] < floor
+
+
 def segment(
     samples: Sequence[Sample],
     frame_width: int,
@@ -283,6 +390,111 @@ def segment(
     return merge_short_runs(
         to_runs(samples, labels), min_seconds, min_reposition_seconds
     )
+
+
+@dataclass(frozen=True)
+class Span:
+    """A stretch of a run that holds a steady speed — a postable clip.
+
+    Named `Span` rather than `Window` because `Window` already means the
+    aggregate of a run of samples that `summarise()` returns.
+    """
+
+    start: float
+    end: float
+    reversals: int
+    spread: float
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+def find_windows(
+    buckets: Sequence[float],
+    *,
+    start: float,
+    min_seconds: float,
+    max_seconds: float,
+    bucket_seconds: float = SPEED_BUCKET_SECONDS,
+    max_spread: float = 3.0,
+    floor: float = SPEED_FLOOR,
+    min_change: float = SPEED_MIN_CHANGE,
+) -> list[Span]:
+    """Every non-overlapping stretch that holds a steady speed for long enough.
+
+    Anchoring the render at the shot's in-point keeps whatever happens to be at
+    the front. On a 21-second take that meant shipping two stop-and-gos and
+    discarding the calm tail; searching the same take found a window 8 seconds
+    in with no reversals and a 1.16x spread, which is the part a human picked by
+    eye. A long take can hold more than one such stretch, so this returns all of
+    them rather than only the best.
+
+    Longest first, then calmest: a clean 15 seconds beats a clean 10, and the
+    leftovers around the chosen windows stay addressable as their own segments.
+    """
+    if not buckets or min_seconds <= 0:
+        return []
+
+    min_len = max(1, int(round(min_seconds / bucket_seconds)))
+    max_len = max(min_len, int(round(max_seconds / bucket_seconds)))
+
+    def score(lo: int, hi: int) -> tuple[int, float] | None:
+        chunk = buckets[lo:hi]
+        if len(chunk) < min_len:
+            return None
+        reversals = speed_reversals(chunk, floor=floor, min_change=min_change)
+        if reversals:
+            return None
+        spread = speed_spread(chunk, floor=floor)
+        # A reveal that starts from rest necessarily has a huge spread; judging
+        # it by the same ratio as a cruising shot would throw away the reveal.
+        if spread > max_spread and not eases_in(chunk, floor=floor):
+            return None
+        return reversals, spread
+
+    taken: list[Span] = []
+    free = [(0, len(buckets))]
+
+    while free:
+        best: tuple[tuple[int, float, int], int, int, int, float] | None = None
+        for lo, hi in free:
+            for length in range(min(max_len, hi - lo), min_len - 1, -1):
+                for offset in range(lo, hi - length + 1):
+                    result = score(offset, offset + length)
+                    if result is None:
+                        continue
+                    reversals, spread = result
+                    # Prefer longer, then calmer, then earlier.
+                    key = (-length, spread, offset)
+                    if best is None or key < best[0]:
+                        best = (key, length, offset, reversals, spread)
+        if best is None:
+            break
+
+        _, length, offset, reversals, spread = best
+        taken.append(
+            Span(
+                start=start + offset * bucket_seconds,
+                end=start + (offset + length) * bucket_seconds,
+                reversals=reversals,
+                spread=round(spread, 3),
+            )
+        )
+        # Carve the chosen span out of the free list; what is left on either
+        # side can still hold another window if it is long enough.
+        remaining: list[tuple[int, int]] = []
+        for lo, hi in free:
+            if offset >= hi or offset + length <= lo:
+                remaining.append((lo, hi))
+                continue
+            if offset - lo >= min_len:
+                remaining.append((lo, offset))
+            if hi - (offset + length) >= min_len:
+                remaining.append((offset + length, hi))
+        free = remaining
+
+    return sorted(taken, key=lambda w: w.start)
 
 
 # ---------------------------------------------------------------------------

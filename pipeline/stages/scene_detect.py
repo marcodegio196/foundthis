@@ -120,8 +120,7 @@ def profile_motion(
         # to 256px is a low-pass that removes the sparkle and not the features:
         # confidence 0.09 -> 0.21 on water, 0.30 -> 0.54 on rock, with the
         # measured shift unchanged. Gaussian blur does not work here — it smears
-        # the structure the correlation needs and inflates jitter to 0.68, and
-        # 384/320px leave the water still misclassified.
+        # the structure the correlation needs and inflates jitter to 0.68.
         frames = media.extract_frames(path, timestamps, tmp, width=256)
         # A frame that failed to extract shifts every later timestamp, so only
         # measure when the two line up.
@@ -130,16 +129,99 @@ def profile_motion(
         return motion.measure(frames, timestamps)
 
 
+def carve_windows(
+    run: motion.Run, samples: list[motion.Sample], frame_width: int, cfg: Config
+) -> list[tuple[float, float, str, list[float], bool]]:
+    """Split one usable run into its steady stretches, keeping the leftovers.
+
+    Stage 4 used to render from a run's in-point, which on a long take ships
+    whatever is at the front. A 21-second take began with a stop-and-go and
+    ended calm; anchored rendering kept the stop-and-go and dropped the calm.
+    Carving here means each steady stretch becomes its own shot, so a take
+    holding two good sections yields two clips instead of one compromised one.
+
+    Leftovers are emitted as their own segments and marked `is_window=False` —
+    the seconds stay addressable if the window rules change later, but they do
+    not reach a render. A run that contains no steady window at all is kept
+    whole and marked the same way: better to publish nothing from it than to
+    ship the lurch because the run happened to be long enough.
+
+    Returns `(start, end, motion_class, speed_profile, is_window)`.
+    """
+    profile = motion.speed_buckets(samples, cfg.motion_sample_fps, frame_width)
+    # A run too short to hold a window is not "outside" one — it is good
+    # footage that does not fit the target length, which is stock inventory,
+    # not a reject. Only runs that could have held a window are judged on
+    # whether they do.
+    carving = bool(
+        cfg.window_selection
+        and profile
+        and cfg.min_render_seconds > 0
+        and run.duration >= cfg.min_render_seconds
+    )
+    # With carving off there is nothing to be outside of, so the run stays
+    # renderable and behaves as it did before windows existed.
+    whole = (run.start, run.end, run.motion_class, profile, not carving)
+    if not carving:
+        return [whole]
+
+    windows = motion.find_windows(
+        profile,
+        start=run.start,
+        min_seconds=cfg.min_render_seconds,
+        max_seconds=cfg.max_render_seconds or run.duration,
+        max_spread=cfg.window_max_spread,
+    )
+    if not windows:
+        return [whole]
+
+    def slice_profile(start: float, end: float) -> list[float]:
+        lo = int(round((start - run.start) / motion.SPEED_BUCKET_SECONDS))
+        hi = int(round((end - run.start) / motion.SPEED_BUCKET_SECONDS))
+        return profile[max(0, lo) : max(0, hi)]
+
+    # Buckets are whole seconds, so a window always stops on a second boundary
+    # and can leave up to a bucket of the run unclaimed. Anything under one
+    # bucket is absorbed into the window rather than emitted on its own: it is
+    # too short to be a shot, and across an archive it would otherwise leave
+    # thousands of sub-second rows behind.
+    sliver = motion.SPEED_BUCKET_SECONDS
+
+    out: list[tuple[float, float, str, list[float], bool]] = []
+    cursor = run.start
+    for win in windows:
+        if win.start - cursor > sliver:
+            out.append(
+                (cursor, win.start, run.motion_class, slice_profile(cursor, win.start), False)
+            )
+            cursor = win.start
+        end = min(win.end, run.end)
+        # Absorb a short tail into this window rather than emitting it alone.
+        if run.end - end <= sliver:
+            end = run.end
+        out.append((cursor, end, run.motion_class, slice_profile(cursor, end), True))
+        cursor = end
+    if run.end - cursor > sliver:
+        out.append(
+            (cursor, run.end, run.motion_class, slice_profile(cursor, run.end), False)
+        )
+    return out
+
+
 def split_by_motion(
     path: str | Path, segments: list[Segment], cfg: Config = default_config
-) -> list[tuple[float, float, str]]:
+) -> list[tuple[float, float, str, list[float]]]:
     """Sub-divide each scene by what the camera is doing inside it.
 
     This is what makes a file containing two good moves separated by a
     reposition become two usable shots plus a flagged one, rather than a single
     shot whose score is the average of all three.
+
+    Each usable run is then carved into the stretches that hold a steady speed,
+    so a take with a lurch at the front does not have to be shipped with it.
+    Every segment carries the speed curve it was measured on.
     """
-    out: list[tuple[float, float, str]] = []
+    out: list[tuple[float, float, str, list[float], bool]] = []
     for start, end in segments:
         try:
             samples, width = profile_motion(path, start, end, cfg)
@@ -157,14 +239,25 @@ def split_by_motion(
         )
         if not runs:
             # Nothing measurable — keep the scene whole rather than dropping it.
-            out.append((start, end, motion.MOVE))
+            out.append((start, end, motion.MOVE, [], True))
             continue
 
         # Sampling starts half an interval in, so stretch the ends back out to
         # the scene boundaries; every second must land in exactly one shot.
         runs[0] = motion.Run(start, runs[0].end, runs[0].motion_class)
         runs[-1] = motion.Run(runs[-1].start, end, runs[-1].motion_class)
-        out.extend((r.start, r.end, r.motion_class) for r in runs)
+
+        for run in runs:
+            inside = [s for s in samples if run.start <= s.midpoint <= run.end]
+            if run.motion_class == motion.REPOSITION:
+                # Repositioning is discarded whole; carving it would only
+                # produce steadier-looking pieces of a hunt.
+                out.append(
+                    (run.start, run.end, run.motion_class,
+                     motion.speed_buckets(inside, cfg.motion_sample_fps, width), True)
+                )
+                continue
+            out.extend(carve_windows(run, inside, width, cfg))
     return out
 
 
@@ -205,11 +298,26 @@ def run(
         # in case the bar moves or a frame of it turns out to be worth keeping.
         rejects = [
             shot_id
-            for shot_id, (_, _, motion_class) in zip(shot_ids, segments)
-            if motion_class == motion.REPOSITION
+            for shot_id, segment in zip(shot_ids, segments)
+            if segment[2] == motion.REPOSITION
         ]
         if rejects:
             db.reject(conn, rejects, "repositioning: camera searching, not composed")
+
+        # Everything outside a steady window is flagged the same way: kept on
+        # disk and addressable, but not offered up for a render. A long run
+        # whose speed never settles produces nothing rather than being shipped
+        # because it cleared the length floor.
+        outside = [
+            shot_id
+            for shot_id, segment in zip(shot_ids, segments)
+            if segment[2] != motion.REPOSITION and len(segment) > 4 and not segment[4]
+        ]
+        if outside:
+            db.reject(
+                conn, outside,
+                f"outside a steady {cfg.min_render_seconds:g}s window",
+            )
 
         counts["sources"] += 1
         counts["shots"] += len(segments)

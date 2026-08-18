@@ -17,13 +17,13 @@ from typing import Any, Iterable, Iterator, Sequence
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 # Bumped when schema.sql changes in a way that needs a migration step.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Columns stored as JSON text. Read helpers decode them; write helpers encode.
 JSON_COLUMNS = frozenset(
     {
         "subject_tags", "mood_tags", "platform_ids", "licensed_to",
-        "delivery_status", "metrics",
+        "delivery_status", "metrics", "speed_profile",
     }
 )
 
@@ -37,6 +37,12 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     ),
     3: (
         "ALTER TABLE shots ADD COLUMN motion_class TEXT",
+    ),
+    4: (
+        "ALTER TABLE shots ADD COLUMN speed_profile TEXT",
+        "ALTER TABLE shots ADD COLUMN speed_reversals INTEGER",
+        "ALTER TABLE shots ADD COLUMN speed_spread REAL",
+        "ALTER TABLE shots ADD COLUMN is_window INTEGER NOT NULL DEFAULT 1",
     ),
 }
 
@@ -133,6 +139,23 @@ def _encode(values: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _speed_reversals(profile: Sequence[float] | None) -> int | None:
+    """Summary of the speed curve, stored so queries need not decode the JSON."""
+    if not profile:
+        return None
+    from . import motion  # local import: db.py stays dependency-free at module level
+
+    return motion.speed_reversals(profile)
+
+
+def _speed_spread(profile: Sequence[float] | None) -> float | None:
+    if not profile:
+        return None
+    from . import motion
+
+    return round(motion.speed_spread(profile), 3)
+
+
 def upsert_source(conn: sqlite3.Connection, **values: Any) -> int:
     """Register a raw file, or refresh its probe data if it is already known.
 
@@ -161,7 +184,8 @@ def replace_shots(
 ) -> list[int]:
     """Write the shot list for a source, replacing any previous detection.
 
-    Segments are `(in, out)` or `(in, out, motion_class)`.
+    Segments are `(in, out)`, `(in, out, motion_class)`, or
+    `(in, out, motion_class, speed_profile)`.
 
     Re-running detection with different thresholds is expected, so this clears
     the source's existing shots first. That discards downstream state for those
@@ -173,9 +197,12 @@ def replace_shots(
         for index, segment in enumerate(segments):
             in_point, out_point = segment[0], segment[1]
             motion_class = segment[2] if len(segment) > 2 else None
+            profile = list(segment[3]) if len(segment) > 3 and segment[3] else None
+            is_window = bool(segment[4]) if len(segment) > 4 else True
             cursor = conn.execute(
                 "INSERT INTO shots (source_id, shot_index, in_point, out_point, "
-                "continuous_move, motion_class) VALUES (?, ?, ?, ?, ?, ?)",
+                "continuous_move, motion_class, speed_profile, speed_reversals, "
+                "speed_spread, is_window) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     source_id,
                     index,
@@ -183,6 +210,10 @@ def replace_shots(
                     out_point,
                     1 if len(segments) == 1 else 0,
                     motion_class,
+                    json.dumps(profile) if profile else None,
+                    _speed_reversals(profile),
+                    _speed_spread(profile),
+                    1 if is_window else 0,
                 ),
             )
             shot_ids.append(int(cursor.lastrowid))

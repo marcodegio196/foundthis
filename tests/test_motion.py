@@ -228,5 +228,139 @@ class TestSegment(unittest.TestCase):
         self.assertEqual(motion.segment([], WIDTH, FPS, min_seconds=3.0), [])
 
 
+class TestSpeedCurve(unittest.TestCase):
+    """Speed steadiness — the thing `jitter` cannot see.
+
+    A camera that stops dead and restarts holds its heading the whole time, so
+    jitter reads it as a clean move. These are the per-second speed curves
+    measured off real clips that were judged by eye, in frame widths per second
+    (the units `speed_buckets` produces), so a hovering drone sits below
+    HELD_RATE and a normal move is a few hundredths.
+    """
+
+    # A steady drift along a coastline, judged good by eye.
+    STEADY = [0.085, 0.113, 0.131, 0.124, 0.125, 0.132, 0.141, 0.119, 0.141,
+              0.121, 0.122, 0.138, 0.146, 0.124]
+    # A move that accelerates hard and then collapses in its last seconds.
+    STOP_AND_GO = [0.078, 0.093, 0.123, 0.139, 0.134, 0.157, 0.182, 0.198,
+                   0.306, 0.400, 0.437, 0.246, 0.058, 0.040]
+    # A drone lifting out of a hover: the opening seconds sit below HELD_RATE.
+    EASE_IN = [0.008, 0.007, 0.039, 0.034, 0.065, 0.097, 0.085, 0.094, 0.116,
+               0.206, 0.258]
+
+    def test_steady_speed_has_no_reversals(self):
+        self.assertEqual(motion.speed_reversals(self.STEADY), 0)
+
+    def test_stop_and_go_reverses(self):
+        self.assertGreater(motion.speed_reversals(self.STOP_AND_GO), 0)
+
+    def test_a_single_ramp_is_not_a_reversal(self):
+        """Speeding up throughout is an ease, however large the change."""
+        self.assertEqual(motion.speed_reversals(self.EASE_IN), 0)
+        self.assertGreater(motion.speed_spread(self.EASE_IN), 3.0)
+
+    def test_near_static_noise_is_not_a_reversal(self):
+        """Below the floor, relative swings are measurement noise."""
+        self.assertEqual(
+            motion.speed_reversals([0.0005, 0.008, 0.001, 0.009, 0.0005]), 0
+        )
+
+    def test_ease_in_is_recognised_from_rest(self):
+        self.assertTrue(motion.eases_in(self.EASE_IN))
+        self.assertFalse(motion.eases_in(self.STOP_AND_GO))
+
+    def test_buckets_are_rates_not_pixels(self):
+        """A rate, so the curve means the same at any resolution or sample rate.
+
+        4px per sample at 4fps across a 512px frame is 16px/s, which is
+        16/512 = 0.03125 frame widths per second.
+        """
+        data = samples([(4, 0)] * 12)  # 4 samples/sec at FPS=4 -> 3 buckets
+        buckets = motion.speed_buckets(data, FPS, WIDTH)
+        self.assertEqual(len(buckets), 3)
+        self.assertAlmostEqual(buckets[0], 4.0 * FPS / WIDTH)
+
+    def test_same_movement_at_double_resolution_reads_the_same(self):
+        slow = motion.speed_buckets(samples([(4, 0)] * 8), FPS, 512)
+        fast = motion.speed_buckets(samples([(8, 0)] * 8), FPS, 1024)
+        self.assertAlmostEqual(slow[0], fast[0])
+
+    def test_degenerate_width_or_rate_yields_nothing(self):
+        self.assertEqual(motion.speed_buckets(samples([(4, 0)] * 8), FPS, 0), [])
+        self.assertEqual(motion.speed_buckets(samples([(4, 0)] * 8), 0, WIDTH), [])
+
+
+class TestFindWindows(unittest.TestCase):
+    """Choosing which seconds to render, rather than the first ones.
+
+    Profiles are in frame widths per second, as `speed_buckets` produces.
+    """
+
+    def test_steady_run_yields_one_window(self):
+        spans = motion.find_windows([0.03] * 14, start=0.0, min_seconds=10, max_seconds=15)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0].reversals, 0)
+        self.assertGreaterEqual(spans[0].duration, 10)
+
+    def test_window_skips_a_lurch_at_the_front(self):
+        """The calm tail is chosen over the stop-and-go at the start."""
+        profile = [0.055, 0.012, 0.045] + [0.03] * 12
+        spans = motion.find_windows(profile, start=100.0, min_seconds=10, max_seconds=15)
+        self.assertEqual(len(spans), 1)
+        self.assertGreaterEqual(spans[0].start, 102.0)
+        self.assertEqual(spans[0].reversals, 0)
+
+    def test_two_clean_stretches_yield_two_windows(self):
+        """A long take holding two good sections gives two clips, not one."""
+        profile = [0.03] * 12 + [0.009, 0.042, 0.011] + [0.031] * 12
+        spans = motion.find_windows(profile, start=0.0, min_seconds=10, max_seconds=15)
+        self.assertEqual(len(spans), 2)
+        self.assertLessEqual(spans[0].end, spans[1].start)
+
+    def test_windows_never_overlap(self):
+        spans = motion.find_windows([0.03] * 40, start=0.0, min_seconds=10, max_seconds=15)
+        for earlier, later in zip(spans, spans[1:]):
+            self.assertLessEqual(earlier.end, later.start)
+
+    def test_run_shorter_than_the_minimum_yields_nothing(self):
+        self.assertEqual(
+            motion.find_windows([0.03] * 6, start=0.0, min_seconds=10, max_seconds=15), []
+        )
+
+    def test_a_reveal_from_rest_is_not_rejected_for_spread(self):
+        """An ease-in has a huge fast/slow ratio by definition; keep it.
+
+        This is the case that failed on real footage: a drone lifting out of a
+        hover measured a 37x spread and was thrown away, despite being the best
+        clip in the set. The opening seconds sit below HELD_RATE, which is what
+        marks it as a reveal rather than a shot that changes speed mid-flight.
+        """
+        profile = TestSpeedCurve.EASE_IN
+        self.assertGreater(motion.speed_spread(profile), 3.0)
+        spans = motion.find_windows(
+            profile, start=0.0, min_seconds=10, max_seconds=15, max_spread=3.0
+        )
+        self.assertEqual(len(spans), 1)
+
+    def test_a_cruise_that_speeds_up_is_not_exempt(self):
+        """The same ramp starting from an existing cruise is a departure.
+
+        Measured off a clip that begins already moving and accelerates away in
+        its final seconds — judged bad by eye, and the shape the ease-in
+        exemption must not let through.
+        """
+        profile = [0.100, 0.124, 0.147, 0.120, 0.109, 0.149, 0.206, 0.242,
+                   0.257, 0.398]
+        self.assertFalse(motion.eases_in(profile))
+        spans = motion.find_windows(
+            profile, start=0.0, min_seconds=10, max_seconds=15, max_spread=3.0
+        )
+        self.assertEqual(spans, [])
+
+    def test_longer_window_wins_when_both_are_clean(self):
+        spans = motion.find_windows([0.03] * 15, start=0.0, min_seconds=10, max_seconds=15)
+        self.assertAlmostEqual(spans[0].duration, 15.0)
+
+
 if __name__ == "__main__":
     unittest.main()

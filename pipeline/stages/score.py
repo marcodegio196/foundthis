@@ -197,18 +197,20 @@ def apply_rejections(
     first, so lowering the bar genuinely brings footage back rather than
     requiring a rescore.
 
-    Repositioning is excluded throughout. That rejection comes from stage 1b and
-    describes what the camera was doing, not how the footage scored, so clearing
-    it here would quietly hand the jerk between two good moves back to the
-    selection queue. Excluding it from the population matters too: a reposition
-    has no motion or stability score, so it would otherwise be ranked on
-    technical quality alone — and a sharp, well-exposed frame of the camera
-    searching scores *above* the bar.
+    Stage 1b's own rejections are excluded throughout — repositioning, and
+    anything carved off as not being a steady window. Those describe what the
+    camera was doing, not how the footage scored, so clearing them here would
+    quietly hand the jerk between two good moves back to the selection queue.
+    Excluding them from the population matters too: a reposition has no motion
+    or stability score, so it would otherwise be ranked on technical quality
+    alone — and a sharp, well-exposed frame of the camera searching scores
+    *above* the bar.
     """
     rows = conn.execute(
         "SELECT id, motion_score, stability_score, technical_score, aesthetic_score "
         "FROM shots WHERE scored_at IS NOT NULL "
-        "AND (motion_class IS NULL OR motion_class != ?)",
+        "AND (motion_class IS NULL OR motion_class != ?) "
+        "AND COALESCE(is_window, 1) = 1",
         (motion.REPOSITION,),
     ).fetchall()
     if not rows:
@@ -252,7 +254,9 @@ def apply_rejections(
     with db.transaction(conn):
         conn.execute(
             "UPDATE shots SET rejected = 0, reject_reason = NULL "
-            "WHERE scored_at IS NOT NULL AND (motion_class IS NULL OR motion_class != ?)",
+            "WHERE scored_at IS NOT NULL "
+            "AND (motion_class IS NULL OR motion_class != ?) "
+            "AND COALESCE(is_window, 1) = 1",
             (motion.REPOSITION,),
         )
     db.reject(conn, below, f"bottom {cfg.reject_percentile:.0%} (< {threshold:.3f})")

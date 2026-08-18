@@ -599,7 +599,9 @@ class TestMotionAgainstKnownCameraMoves(IntegrationTestCase):
             seconds=10,
         )
         segments = scene_detect.split_by_motion(clip, [(0.0, 10.0)], self.cfg)
-        classes = [motion_class for _, _, motion_class in segments]
+        # Segments carry their speed curve as a fourth element; index rather
+        # than unpack so the arity can grow without rewriting the assertion.
+        classes = [segment[2] for segment in segments]
         self.assertEqual(classes.count(motion.REPOSITION), 1)
         self.assertEqual(len([c for c in classes if c in motion.USABLE]), 2)
 
@@ -616,8 +618,8 @@ class TestMotionAgainstKnownCameraMoves(IntegrationTestCase):
         self.assertAlmostEqual(reposition[1], 6.0, delta=0.9)
         self.assertEqual(segments[0][0], 0.0)
         self.assertEqual(segments[-1][1], 10.0)
-        for (_, end, _), (start, _, _) in zip(segments, segments[1:]):
-            self.assertEqual(end, start)
+        for earlier, later in zip(segments, segments[1:]):
+            self.assertEqual(earlier[1], later[0])
 
     def test_repositioning_is_flagged_not_deleted(self):
         clip = self.cfg.archive_root / "albania/DJI_MULTI.MP4"

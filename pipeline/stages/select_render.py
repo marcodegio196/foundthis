@@ -203,7 +203,10 @@ def run(
         + (f" LIMIT {int(limit)}" if limit else "")
     ).fetchall()
 
-    counts = {"rendered": 0, "skipped_short": 0, "skipped_jerk": 0, "failed": 0}
+    counts = {
+        "rendered": 0, "skipped_short": 0, "skipped_jerk": 0,
+        "skipped_rejected": 0, "failed": 0,
+    }
     for row in rows:
         # Repositioning never renders, however it was approved. A jerk that
         # reached the queue is an upstream mistake, not something to burn an
@@ -211,6 +214,14 @@ def run(
         if row["motion_class"] == motion.REPOSITION:
             log.info("shot %s skipped: repositioning", row["id"])
             counts["skipped_jerk"] += 1
+            continue
+
+        # A rejected shot is not publishable, and approving one individually is
+        # not the way to overrule that — `score --rejections-only` re-draws the
+        # bar for everything at once, which is the honest way to change it.
+        if row["rejected"]:
+            log.info("shot %s skipped: %s", row["id"], row["reject_reason"] or "rejected")
+            counts["skipped_rejected"] += 1
             continue
 
         in_point, out_point = clip_bounds(row, cfg)

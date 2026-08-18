@@ -62,6 +62,21 @@ CREATE TABLE IF NOT EXISTS shots (
     -- composition). Repositioning is flagged rejected on creation.
     motion_class      TEXT,
 
+    -- Speed curve: mean movement per second across the shot, JSON array. Built
+    -- from the samples stage 1b already takes, so it costs no extra decode.
+    -- `jitter` catches a camera that changes direction; this catches one that
+    -- changes speed — a move that stops dead and restarts holds its heading
+    -- throughout and is invisible to every other measure here.
+    speed_profile     TEXT,                      -- JSON array of px-per-sample
+    speed_reversals   INTEGER,                   -- direction flips in the speed curve
+    speed_spread      REAL,                      -- fastest second / slowest second
+
+    -- 0 = this stretch was carved off as the part of a run that is not steady,
+    -- or is a run long enough to hold a window that never settles. Stage 2
+    -- recomputes its own rejections from scratch every run, so it needs to know
+    -- which rejections came from stage 1b and must survive that.
+    is_window         INTEGER NOT NULL DEFAULT 1,
+
     -- ---------------------------------------------------------------------
     -- Stage 2 — score & filter
     -- ---------------------------------------------------------------------

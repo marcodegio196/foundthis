@@ -79,6 +79,17 @@ class Config:
     min_render_seconds: float = _float("MIN_RENDER_SECONDS", 0.0)
     max_render_seconds: float = _float("MAX_RENDER_SECONDS", 0.0)
 
+    # Stage 1b — carve each usable run into the stretches that actually hold a
+    # steady speed, rather than taking whatever sits at the front of it. A long
+    # take can hold more than one, and each becomes its own shot; the leftovers
+    # around them stay addressable instead of being deleted.
+    # Set WINDOW_SELECTION=0 to keep runs whole.
+    window_selection: bool = os.environ.get("WINDOW_SELECTION", "1") not in ("0", "false", "")
+    # Widest ratio between the fastest and slowest second inside a window. A
+    # reveal that starts from a hover is exempt — it necessarily has a huge
+    # ratio, and it is the shape of a deliberate reveal, not a lurch.
+    window_max_spread: float = _float("WINDOW_MAX_SPREAD", 3.0)
+
     render_root: Path = _path("RENDER_ROOT", "./renders")
     overlay_text: str = os.environ.get("OVERLAY_TEXT", "Found this.")
     # ffmpeg's drawtext needs an explicit font file on most Linux builds; on
