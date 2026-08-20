@@ -63,6 +63,12 @@ class Config:
     # default — the jitter test does most of the work.
     motion_max_rate: float = _float("MOTION_MAX_RATE", 1.0)
 
+    # Sources segmented in parallel. Each worker drives ffmpeg and OpenCV, so
+    # the work happens outside the interpreter lock; the limit is cores and how
+    # fast the drive feeds them. Lower it if the archive lives on a spinning or
+    # network disk, where the decodes contend rather than overlap.
+    segment_workers: int = _int("SEGMENT_WORKERS", min(8, (os.cpu_count() or 2)))
+
     # Stage 2 — bottom percentile is flagged, never deleted.
     reject_percentile: float = _float("REJECT_PERCENTILE", 0.35)
     sample_fps: float = _float("SAMPLE_FPS", 1.0)

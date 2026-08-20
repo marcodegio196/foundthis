@@ -218,6 +218,53 @@ def extract_frames(
     return written
 
 
+def extract_frames_at_rate(
+    path: str | Path,
+    out_dir: str | Path,
+    *,
+    start: float,
+    end: float,
+    fps: float,
+    width: int = 256,
+    max_frames: int = 600,
+) -> tuple[list[Path], list[float]]:
+    """Decode a range once, writing one frame every 1/fps seconds.
+
+    `extract_frames` seeks separately for every timestamp, which is right when
+    the samples are sparse: scoring takes one frame a second from a fifteen
+    second shot, and decoding the whole range to reach fifteen frames would be
+    wasteful.
+
+    Motion profiling asks the opposite question — four frames a second across a
+    whole scene — and there the per-frame seek dominates. Measured on an 89
+    second 4K file: 1.75s per frame seeking, 0.29s per frame in a single pass.
+    Six times slower, and the reason segmenting eight minutes of footage took
+    fifty-seven.
+
+    Returns the frames written and the timestamp each one sits at.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    duration = max(end - start, 0.0)
+    if duration <= 0 or fps <= 0:
+        return [], []
+
+    run(
+        [
+            FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(path),
+            "-vf", f"fps={fps},scale={width}:-2",
+            "-frames:v", str(max_frames),
+            "-q:v", "3",
+            str(out_dir / "%05d.jpg"),
+        ]
+    )
+    written = sorted(out_dir.glob("*.jpg"))
+    # The fps filter emits its first frame at the start of the range and one
+    # every interval after, so the timestamps follow from the index.
+    return written, [start + index / fps for index in range(len(written))]
+
+
 def iter_gray_frames(
     path: str | Path, timestamps: list[float], *, width: int = 256
 ) -> Iterator[Any]:

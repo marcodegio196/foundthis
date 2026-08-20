@@ -306,6 +306,85 @@ class TestTag(StageTestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestSegmentConcurrency(StageTestCase):
+    """Sources are analysed in parallel; every write stays on one thread."""
+
+    def sources(self, count):
+        return [
+            self.add_source(
+                path=f"/archive/c{i}/x.mp4", relpath=f"c{i}/x.mp4", duration=30.0
+            )
+            for i in range(count)
+        ]
+
+    def test_every_source_is_recorded(self):
+        self.sources(6)
+        with mock.patch.object(
+            scene_detect, "analyse_source",
+            side_effect=lambda src, cfg, profile: [(0.0, 10.0, "move", [], True)],
+        ):
+            counts = scene_detect.run(self.conn, self.cfg, workers=4)
+        self.assertEqual(counts["sources"], 6)
+        self.assertEqual(
+            self.conn.execute("SELECT count(*) FROM shots").fetchone()[0], 6
+        )
+
+    def test_writes_happen_on_the_calling_thread(self):
+        """A shared SQLite connection written from a worker corrupts silently."""
+        self.sources(6)
+        main = threading.get_ident()
+        seen = []
+        real = db.replace_shots
+
+        def spy(conn, source_id, segments):
+            seen.append(threading.get_ident())
+            return real(conn, source_id, segments)
+
+        with mock.patch.object(
+            scene_detect, "analyse_source",
+            side_effect=lambda src, cfg, profile: [(0.0, 10.0, "move", [], True)],
+        ), mock.patch.object(scene_detect.db, "replace_shots", side_effect=spy):
+            scene_detect.run(self.conn, self.cfg, workers=4)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {main})
+
+    def test_one_bad_source_does_not_stall_the_rest(self):
+        ids = self.sources(5)
+        bad = ids[2]
+
+        def analyse(source, cfg, profile):
+            if source["id"] == bad:
+                raise RuntimeError("unreadable")
+            return [(0.0, 10.0, "move", [], True)]
+
+        with mock.patch.object(scene_detect, "analyse_source", side_effect=analyse):
+            counts = scene_detect.run(self.conn, self.cfg, workers=4)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["sources"], 4)
+
+    def test_serial_and_parallel_agree(self):
+        self.sources(4)
+        with mock.patch.object(
+            scene_detect, "analyse_source",
+            side_effect=lambda src, cfg, profile: [(0.0, 10.0, "move", [], True)],
+        ):
+            parallel = scene_detect.run(self.conn, self.cfg, workers=4)
+        self.conn.execute("UPDATE sources SET scene_detected_at = NULL")
+        with mock.patch.object(
+            scene_detect, "analyse_source",
+            side_effect=lambda src, cfg, profile: [(0.0, 10.0, "move", [], True)],
+        ):
+            serial = scene_detect.run(self.conn, self.cfg, workers=1)
+        self.assertEqual(parallel, serial)
+
+    def test_a_source_without_duration_is_skipped_not_analysed(self):
+        self.add_source(path="/archive/x/none.mp4", relpath="x/none.mp4", duration=None)
+        with mock.patch.object(scene_detect, "analyse_source") as analyse:
+            counts = scene_detect.run(self.conn, self.cfg, workers=2)
+        analyse.assert_not_called()
+        self.assertEqual(counts["failed"], 1)
+
+
 class TestSelection(StageTestCase):
     def test_queue_holds_survivors_tagged_or_not(self):
         """Tagging is optional: country comes from the folder, year from the

@@ -23,12 +23,18 @@ from __future__ import annotations
 import logging
 import sqlite3
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .. import db, media, motion
 from ..config import Config, config as default_config
 
 log = logging.getLogger(__name__)
+
+# How often to report progress. Segmenting an archive runs for hours;
+# silence that long is indistinguishable from a hang.
+PROGRESS_EVERY = 5
 
 Segment = tuple[float, float]
 
@@ -106,11 +112,6 @@ def profile_motion(
     path: str | Path, start: float, end: float, cfg: Config = default_config
 ) -> tuple[list[motion.Sample], int]:
     """Sample a stretch of a file and measure what the camera is doing."""
-    timestamps = media.sample_timestamps(
-        start, end, cfg.motion_sample_fps, max_frames=cfg.motion_max_frames
-    )
-    if len(timestamps) < 2:
-        return [], 0
     with tempfile.TemporaryDirectory(prefix="motion-") as tmp:
         # 256px, matching `media.iter_gray_frames`. Phase correlation needs a
         # clean peak, and specular sparkle on water is high-frequency noise that
@@ -121,11 +122,19 @@ def profile_motion(
         # confidence 0.09 -> 0.21 on water, 0.30 -> 0.54 on rock, with the
         # measured shift unchanged. Gaussian blur does not work here — it smears
         # the structure the correlation needs and inflates jitter to 0.68.
-        frames = media.extract_frames(path, timestamps, tmp, width=256)
-        # A frame that failed to extract shifts every later timestamp, so only
-        # measure when the two line up.
-        if len(frames) != len(timestamps):
-            timestamps = timestamps[: len(frames)]
+        #
+        # One decode pass rather than a seek per frame: this asks for four
+        # frames a second across a whole scene, where seeking costs six times
+        # more per frame than decoding straight through.
+        frames, timestamps = media.extract_frames_at_rate(
+            path, tmp,
+            start=start, end=end,
+            fps=cfg.motion_sample_fps,
+            width=256,
+            max_frames=cfg.motion_max_frames,
+        )
+        if len(timestamps) < 2:
+            return [], 0
         return motion.measure(frames, timestamps)
 
 
@@ -280,36 +289,67 @@ def split_by_motion(
     return out
 
 
+def analyse_source(
+    source: db.Row, cfg: Config, profile: bool
+) -> list[tuple[float, float, str, list[float], bool]]:
+    """Everything a source needs before anything is written down.
+
+    Kept free of the database so it can run on a worker thread: SQLite
+    connections are not safe to share, and this is where all the time goes —
+    a decode pass for the cut detector, then another per scene for the motion
+    profile.
+    """
+    scenes = detect_segments(source["path"], source["duration"], cfg)
+    if not profile:
+        return [(a, b, motion.MOVE, [], True) for a, b in scenes]
+    return split_by_motion(source["path"], scenes, cfg)
+
+
 def run(
     conn: sqlite3.Connection,
     cfg: Config = default_config,
     *,
     limit: int | None = None,
     profile: bool | None = None,
+    workers: int | None = None,
 ) -> dict[str, int]:
-    """Segment every source that has not been through detection yet."""
+    """Segment every source that has not been through detection yet.
+
+    Sources are independent, and each one spends its time inside ffmpeg and
+    OpenCV rather than the interpreter, so they are analysed in parallel.
+    **Every database write stays on this thread** — the same rule stage 2
+    follows, for the same reason: a SQLite connection cannot be shared.
+
+    This is the long pass. Before it was parallel, eight minutes of 4K took
+    fifty-seven minutes on one core.
+    """
     profile = cfg.motion_segmentation if profile is None else profile
+    workers = workers if workers is not None else cfg.segment_workers
     counts = {
         "sources": 0, "shots": 0, "usable": 0, "reposition": 0,
         "continuous": 0, "failed": 0,
     }
 
     pending = db.sources_pending_scene_detection(conn)
-    for source in pending[:limit] if limit else pending:
+    sources = pending[:limit] if limit else pending
+    ready = []
+    for source in sources:
         if not source["duration"]:
             log.warning("skipping %s: no duration probed", source["relpath"])
             counts["failed"] += 1
             continue
-        try:
-            scenes = detect_segments(source["path"], source["duration"], cfg)
-            if profile:
-                segments = split_by_motion(source["path"], scenes, cfg)
-            else:
-                segments = [(a, b, motion.MOVE) for a, b in scenes]
-        except Exception as exc:  # detector failures must not stall the archive
-            log.warning("scene detection failed for %s: %s", source["relpath"], exc)
+        ready.append(source)
+    if not ready:
+        return counts
+
+    total = len(ready)
+    started = time.monotonic()
+
+    def record(source: db.Row, segments, error: Exception | None) -> None:
+        if error is not None:  # one bad file must not stall the archive
+            log.warning("scene detection failed for %s: %s", source["relpath"], error)
             counts["failed"] += 1
-            continue
+            return
 
         shot_ids = db.replace_shots(conn, source["id"], segments)
 
@@ -347,5 +387,34 @@ def run(
             "%s -> %d shot(s), %d usable",
             source["relpath"], len(segments), len(segments) - len(rejects),
         )
+
+        done = counts["sources"] + counts["failed"]
+        if done % PROGRESS_EVERY == 0 or done == total:
+            rate = done / max(time.monotonic() - started, 1e-6)
+            remaining = (total - done) / rate if rate else 0
+            log.warning(  # at warning so a long run reports without -v
+                "segmented %d/%d sources (%.1f/min, ~%d min left)",
+                done, total, rate * 60, round(remaining / 60),
+            )
+
+    if workers <= 1:
+        for source in ready:
+            try:
+                record(source, analyse_source(source, cfg, profile), None)
+            except Exception as exc:
+                record(source, None, exc)
+        return counts
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending_futures = {
+            pool.submit(analyse_source, source, cfg, profile): source
+            for source in ready
+        }
+        for future in as_completed(pending_futures):
+            source = pending_futures[future]
+            try:
+                record(source, future.result(), None)
+            except Exception as exc:
+                record(source, None, exc)
 
     return counts
