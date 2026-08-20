@@ -194,17 +194,23 @@ class TestStageQueues(DBTestCase):
         self.assertEqual(row["rejected"], 1)
         self.assertEqual(row["reject_reason"], "bottom percentile")
 
-    def test_selection_queue_needs_tags(self):
-        self.assertEqual(db.selection_queue(self.conn), [])
+    def test_selection_queue_does_not_require_tags(self):
+        """Stage 3 is optional, so gating the queue on it would stall the feed
+        on a pass that earns nothing once place comes from the folder."""
+        self.assertIn(self.survivor, [r["id"] for r in db.selection_queue(self.conn)])
         db.update_shot(self.conn, self.survivor, tagged_at="2026-01-02")
-        rows = db.selection_queue(self.conn)
-        self.assertEqual([r["id"] for r in rows], [self.survivor])
+        self.assertIn(self.survivor, [r["id"] for r in db.selection_queue(self.conn)])
 
     def test_selection_queue_drops_posted_shots(self):
-        db.update_shot(
-            self.conn, self.survivor, tagged_at="2026-01-02", posted_at="2026-01-03"
+        db.update_shot(self.conn, self.survivor, posted_at="2026-01-03")
+        self.assertNotIn(
+            self.survivor, [r["id"] for r in db.selection_queue(self.conn)]
         )
-        self.assertEqual(db.selection_queue(self.conn), [])
+
+    def test_selection_queue_drops_rejects(self):
+        self.assertNotIn(
+            self.rejected, [r["id"] for r in db.selection_queue(self.conn)]
+        )
 
     def test_shot_details_joins_source_fields(self):
         rows = db.shots_pending_tagging(self.conn)

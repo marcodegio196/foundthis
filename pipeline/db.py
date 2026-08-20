@@ -264,10 +264,19 @@ def shots_pending_tagging(conn: sqlite3.Connection, limit: int | None = None) ->
 
 
 def selection_queue(conn: sqlite3.Connection, limit: int | None = None) -> list[Row]:
-    """Tagged, un-posted survivors awaiting a stage 4 decision."""
+    """Un-posted survivors awaiting a stage 4 decision.
+
+    Tagging is optional. Country comes from the folder a file sits in and the
+    year from its capture timestamp, which is everything the overlay and the
+    caption need, so requiring `tagged_at` here would stall the whole feed on a
+    stage that earns nothing for it.
+
+    Ordering is only a stable starting point — stage 4 shuffles this, because
+    ranking by score walks a large archive best-country-first.
+    """
     return conn.execute(
         "SELECT * FROM shot_details "
-        "WHERE rejected = 0 AND tagged_at IS NOT NULL AND posted_at IS NULL "
+        "WHERE rejected = 0 AND posted_at IS NULL "
         "AND selection_state IN ('unreviewed', 'queued') "
         "ORDER BY selection_state DESC, aesthetic_score DESC"
         + (f" LIMIT {int(limit)}" if limit else "")

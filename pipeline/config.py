@@ -97,6 +97,14 @@ class Config:
     overlay_font: str | None = os.environ.get("OVERLAY_FONT") or None
     licensing_codec: str = os.environ.get("LICENSING_CODEC", "libx264")
 
+    # Stage 4 — the selection queue is shuffled rather than ranked, so the feed
+    # spreads the whole archive across the calendar instead of working through
+    # the best country first. Set SELECTION_SEED to make that shuffle repeatable
+    # when comparing two runs; leave it unset for a different order every time.
+    selection_seed: int | None = (
+        int(os.environ["SELECTION_SEED"]) if os.environ.get("SELECTION_SEED") else None
+    )
+
     # Stage 5 — Zernio credentials are read by pipeline/zernio.py from
     # ZERNIO_API_KEY / ZERNIO_BASE_URL / ZERNIO_PROFILE_ID, matching the names
     # the new-visu app already uses so one .env serves both.

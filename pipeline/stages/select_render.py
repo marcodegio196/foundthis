@@ -9,6 +9,7 @@ deleting the human step, not rewriting the stage.
 from __future__ import annotations
 
 import logging
+import random
 import sqlite3
 from pathlib import Path
 
@@ -17,9 +18,12 @@ from ..config import Config, config as default_config
 
 log = logging.getLogger(__name__)
 
-# How many recent posts a country or mood must sit outside of to come up again.
-# The feed's whole premise is range; three coastlines in a row reads as one trip.
+# How many recent posts a country, year, or mood must sit outside of to come up
+# again. The feed's whole premise is range; three coastlines in a row reads as
+# one trip, and a run of clips from the same summer reads as one holiday even
+# when the countries differ.
 COUNTRY_COOLDOWN = 4
+YEAR_COOLDOWN = 3
 MOOD_COOLDOWN = 3
 
 # Roughly one in eight posts should have you in frame — enough to make it a
@@ -36,15 +40,35 @@ def _recent(conn: sqlite3.Connection, limit: int) -> list[db.Row]:
 
 
 def propose_queue(
-    conn: sqlite3.Connection, count: int = 10
+    conn: sqlite3.Connection,
+    count: int = 10,
+    *,
+    rng: random.Random | None = None,
 ) -> list[tuple[db.Row, str]]:
     """Pick the next shots to review, with the reason each was chosen.
 
     Returns (shot, reason) so the approval step shows *why* a shot surfaced —
     a queue you can't interrogate is one you stop trusting and start ignoring.
+
+    Order is random, not ranked. Ranking by score walks the archive in quality
+    order, which on a 250GB library means the feed works through the best
+    country first and only reaches the rest months later; shuffling spreads the
+    whole archive across the calendar instead. Diversity is then applied on top
+    of the shuffle as a filter, so what comes out is random *within* the range
+    rules rather than a fixed rotation.
+
+    The rules relax in tiers when the archive is too thin to satisfy them, so a
+    small library still produces a queue — but the reason attached to each pick
+    says which tier it came from, so a feed that has quietly stopped varying is
+    visible rather than silent.
     """
-    recent = _recent(conn, max(COUNTRY_COOLDOWN, MOOD_COOLDOWN))
+    rng = rng or random.Random(default_config.selection_seed)
+
+    recent = _recent(conn, max(COUNTRY_COOLDOWN, YEAR_COOLDOWN, MOOD_COOLDOWN))
     recent_countries = {r["country"] for r in recent[:COUNTRY_COOLDOWN] if r["country"]}
+    recent_years = {
+        layout.year_of(r["captured_at"]) for r in recent[:YEAR_COOLDOWN]
+    }
     recent_moods = {m for r in recent[:MOOD_COOLDOWN] for m in (r["mood_tags"] or [])}
 
     posted = conn.execute(
@@ -52,36 +76,61 @@ def propose_queue(
     ).fetchone()[0]
     want_person = posted > 0 and posted % PERSON_EVERY == 0
 
-    candidates = db.selection_queue(conn)
+    candidates = list(db.selection_queue(conn))
+    rng.shuffle(candidates)
+
+    # `person_in_frame` is only known if the tagging pass ran. Without it the
+    # slot would match nothing and this post would return an empty queue rather
+    # than a shot, stalling the feed every PERSON_EVERY posts.
+    if want_person and not any(row["person_in_frame"] for row in candidates):
+        want_person = False
+
     chosen: list[tuple[db.Row, str]] = []
+    picked: set[int] = set()
     used_countries: set[str] = set()
+    used_years: set[str] = set()
 
-    for row in candidates:
-        if len(chosen) >= count:
-            break
-        moods = set(row["mood_tags"] or [])
-
-        if want_person and not row["person_in_frame"]:
-            continue
-        if row["country"] and row["country"] in recent_countries | used_countries:
-            continue
-        if moods and moods <= recent_moods:
-            continue
-
-        reason = "you in frame" if want_person else "new country / mood"
+    def take(row: db.Row, reason: str) -> None:
         chosen.append((row, reason))
+        picked.add(row["id"])
         if row["country"]:
             used_countries.add(row["country"])
+        used_years.add(layout.year_of(row["captured_at"]))
 
-    # Diversity rules can starve the queue on a thin archive; fall back to the
-    # best-scoring survivors rather than returning nothing to review.
-    if len(chosen) < count:
-        picked = {row["id"] for row, _ in chosen}
+    # Each tier drops one rule, weakest first. Mood goes before year because it
+    # is the softest signal and is absent entirely unless the optional tagging
+    # pass ran — leaving it in an early tier let it knock every candidate down
+    # to the country-only tier, where year is not checked at all, which quietly
+    # disabled the year rule. Country outlives year because two clips from the
+    # same place read as repetition more strongly than two from the same summer.
+    tiers = (
+        ("new country / year / mood", True, True, True),
+        ("new country / year", True, True, False),
+        ("new country", True, False, False),
+        ("no rules left to apply", False, False, False),
+    )
+
+    for reason, by_country, by_year, by_mood in tiers:
         for row in candidates:
             if len(chosen) >= count:
-                break
-            if row["id"] not in picked:
-                chosen.append((row, "top score (diversity rules exhausted)"))
+                return chosen
+            if row["id"] in picked:
+                continue
+            if want_person and not row["person_in_frame"]:
+                continue
+            if by_country and row["country"] and (
+                row["country"] in recent_countries | used_countries
+            ):
+                continue
+            if by_year and layout.year_of(row["captured_at"]) in (
+                recent_years | used_years
+            ):
+                continue
+            if by_mood:
+                moods = set(row["mood_tags"] or [])
+                if moods and moods <= recent_moods:
+                    continue
+            take(row, "you in frame" if want_person else reason)
 
     return chosen
 

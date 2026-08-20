@@ -31,20 +31,33 @@ log = logging.getLogger(__name__)
 DEFAULT_PLATFORMS = ("instagram", "tiktok")
 
 
-def build_caption(row: db.Row, cfg: Config = default_config) -> str:
-    """Caption for the post: the headline, the place, then mood as hashtags."""
-    location = " · ".join(part for part in (row["site"], row["country"]) if part)
-    parts = [cfg.overlay_text]
-    if location:
-        parts.append(location.title())
-    if row["description"]:
-        parts.append(row["description"])
+# Instagram shows roughly the first 125 characters and hides the rest behind
+# "more". The caption is built to use that: the headline alone above the fold,
+# the place and year only for someone who taps.
+#
+# The gap cannot be blank lines. Instagram strips trailing whitespace and
+# collapses runs of empty lines, so a stack of newlines arrives as a single
+# break and the reveal never happens. U+2800 BRAILLE PATTERN BLANK renders as
+# nothing but is not whitespace, so it survives that normalisation.
+GAP_LINE = "\u2800"
+GAP_LINES = 10
 
-    tags = list(row["mood_tags"] or []) + list(row["subject_tags"] or [])
-    body = "\n\n".join(parts)
-    if tags:
-        body += "\n\n" + " ".join(f"#{tag.replace('-', '')}" for tag in tags[:8])
-    return body
+
+def build_caption(row: db.Row, cfg: Config = default_config) -> str:
+    """Headline, a long gap, then where and when, read after tapping "more".
+
+    Everything here comes from the file and the folder holding it: the country
+    from `input/<country>/`, the year from the capture timestamp. No tagging
+    pass, so nothing costs a model call per shot or goes stale.
+    """
+    year = (row["captured_at"] or "")[:4]
+    country = (row["country"] or "").title()
+    place = " \u00b7 ".join(part for part in (country, year) if part)
+    if not place:
+        return cfg.overlay_text
+
+    gap = "\n".join([""] + [GAP_LINE] * GAP_LINES + [""])
+    return f"{cfg.overlay_text}{gap}\n{place}"
 
 
 class PublishClient(Protocol):

@@ -5,6 +5,7 @@ suite exercises the control flow — what gets picked up, what gets written back
 what a failure does to the rest of the batch — without the toolchain.
 """
 
+import random
 import tempfile
 import threading
 import unittest
@@ -306,12 +307,16 @@ class TestTag(StageTestCase):
 
 
 class TestSelection(StageTestCase):
-    def test_queue_holds_only_tagged_survivors(self):
-        wanted = self.add_shot()
-        self.add_shot(tagged=False)
+    def test_queue_holds_survivors_tagged_or_not(self):
+        """Tagging is optional: country comes from the folder, year from the
+        file, and that is all the overlay and caption need."""
+        tagged = self.add_shot()
+        untagged = self.add_shot(tagged=False)
         self.add_shot(rejected=1)
         proposed = select_render.propose_queue(self.conn, 10)
-        self.assertEqual([row["id"] for row, _ in proposed], [wanted])
+        self.assertEqual(
+            sorted(row["id"] for row, _ in proposed), sorted([tagged, untagged])
+        )
 
     def test_recently_posted_country_is_skipped(self):
         albania = self.add_source()
@@ -338,7 +343,73 @@ class TestSelection(StageTestCase):
         self.add_shot(albania)
         proposed = select_render.propose_queue(self.conn, 3)
         self.assertEqual(len(proposed), 3)
-        self.assertTrue(any("diversity rules exhausted" in r for _, r in proposed))
+        self.assertTrue(any("no rules left" in r for _, r in proposed))
+
+    def test_recently_posted_year_is_skipped(self):
+        """Two clips from the same summer read as one holiday, even from
+        different countries."""
+        old_year = self.add_source(
+            path="/archive/peru/a.mp4", relpath="peru/a.mp4",
+            country="peru", captured_at="2019-07-01T00:00:00Z",
+        )
+        same_year = self.add_source(
+            path="/archive/chile/b.mp4", relpath="chile/b.mp4",
+            country="chile", captured_at="2024-07-01T00:00:00Z",
+        )
+        self.add_shot(
+            self.add_source(), posted_at="2026-02-01", selection_state="approved"
+        )  # posted, captured 2024
+        self.add_shot(same_year)
+        wanted = self.add_shot(old_year)
+        proposed = select_render.propose_queue(
+            self.conn, 1, rng=random.Random(0)
+        )
+        self.assertEqual(proposed[0][0]["id"], wanted)
+        self.assertIn("year", proposed[0][1])
+
+    def test_one_shot_per_year_within_a_batch(self):
+        for index, year in enumerate(("2021", "2022", "2023")):
+            self.add_shot(
+                self.add_source(
+                    path=f"/archive/c{index}/x.mp4", relpath=f"c{index}/x.mp4",
+                    country=f"c{index}", captured_at=f"{year}-05-01T00:00:00Z",
+                )
+            )
+        proposed = select_render.propose_queue(self.conn, 3)
+        years = [(row["captured_at"] or "")[:4] for row, r in proposed
+                 if "year" in r]
+        self.assertEqual(len(years), len(set(years)))
+
+    def test_order_is_shuffled_not_ranked(self):
+        """Ranking walks the archive best-country-first; the feed needs range."""
+        for index in range(12):
+            self.add_shot(
+                self.add_source(
+                    path=f"/archive/c{index}/x.mp4", relpath=f"c{index}/x.mp4",
+                    country=f"c{index}", captured_at=f"20{10 + index}-05-01T00:00:00Z",
+                )
+            )
+        first = [row["id"] for row, _ in
+                 select_render.propose_queue(self.conn, 12, rng=random.Random(1))]
+        second = [row["id"] for row, _ in
+                  select_render.propose_queue(self.conn, 12, rng=random.Random(2))]
+        self.assertNotEqual(first, second)
+        self.assertEqual(sorted(first), sorted(second))
+
+    def test_a_seeded_shuffle_repeats(self):
+        """Same seed, same queue — so two runs can be compared."""
+        for index in range(8):
+            self.add_shot(
+                self.add_source(
+                    path=f"/archive/c{index}/x.mp4", relpath=f"c{index}/x.mp4",
+                    country=f"c{index}", captured_at=f"20{10 + index}-05-01T00:00:00Z",
+                )
+            )
+        a = [row["id"] for row, _ in
+             select_render.propose_queue(self.conn, 8, rng=random.Random(7))]
+        b = [row["id"] for row, _ in
+             select_render.propose_queue(self.conn, 8, rng=random.Random(7))]
+        self.assertEqual(a, b)
 
     def test_every_pick_carries_a_reason(self):
         self.add_shot()
@@ -466,22 +537,51 @@ class TestDistribute(StageTestCase):
             **fields,
         )
 
-    def test_caption_includes_place_description_and_tags(self):
-        shot_id = self.add_shot(inferred_site="Ksamil")
+    def test_caption_is_headline_gap_then_place_and_year(self):
+        """Instagram truncates at ~125 chars: the headline sits above the fold
+        and the place is the payoff for tapping "more"."""
+        shot_id = self.add_shot()
         row = self.conn.execute(
             "SELECT * FROM shot_details WHERE id = ?", (shot_id,)
         ).fetchone()
         caption = distribute.build_caption(row, self.cfg)
-        self.assertIn("Found this.", caption)
-        self.assertIn("Ksamil", caption)
-        self.assertIn("#solitude", caption)
+        self.assertTrue(caption.startswith("Found this."))
+        self.assertTrue(caption.rstrip().endswith("Albania · 2024"))
 
-    def test_caption_hashtags_drop_hyphens(self):
-        shot_id = self.add_shot(mood_tags=["golden-hour"])
+    def test_caption_gap_is_not_plain_whitespace(self):
+        """Instagram collapses runs of empty lines, so a whitespace-only gap
+        would vanish and the reveal would never happen."""
+        shot_id = self.add_shot()
         row = self.conn.execute(
             "SELECT * FROM shot_details WHERE id = ?", (shot_id,)
         ).fetchone()
-        self.assertIn("#goldenhour", distribute.build_caption(row, self.cfg))
+        middle = distribute.build_caption(row, self.cfg)[len("Found this."):]
+        self.assertIn(distribute.GAP_LINE, middle)
+        self.assertFalse(distribute.GAP_LINE.isspace())
+
+    def test_caption_carries_no_model_output(self):
+        """Nothing in the caption comes from the optional tagging pass."""
+        shot_id = self.add_shot(
+            inferred_site="Ksamil",
+            description="A coastline at dusk.",
+            mood_tags=["golden-hour"],
+            subject_tags=["coastline"],
+        )
+        row = self.conn.execute(
+            "SELECT * FROM shot_details WHERE id = ?", (shot_id,)
+        ).fetchone()
+        caption = distribute.build_caption(row, self.cfg)
+        self.assertNotIn("#", caption)
+        self.assertNotIn("Ksamil", caption)
+        self.assertNotIn("dusk", caption)
+
+    def test_caption_without_country_or_date_is_just_the_headline(self):
+        source = self.add_source(country=None, captured_at=None)
+        shot_id = self.add_shot(source)
+        row = self.conn.execute(
+            "SELECT * FROM shot_details WHERE id = ?", (shot_id,)
+        ).fetchone()
+        self.assertEqual(distribute.build_caption(row, self.cfg), "Found this.")
 
     def test_publish_records_zernio_post_id_and_accounts(self):
         shot_id = self.postable_shot()
