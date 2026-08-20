@@ -465,7 +465,7 @@ def find_windows(
     min_len = max(1, int(round(min_seconds / bucket_seconds)))
     max_len = max(min_len, int(round(max_seconds / bucket_seconds)))
 
-    def score(lo: int, hi: int) -> tuple[int, float] | None:
+    def score(lo: int, hi: int, allow_ease_in: bool) -> tuple[int, float] | None:
         chunk = buckets[lo:hi]
         if len(chunk) < min_len:
             return None
@@ -473,53 +473,67 @@ def find_windows(
         if reversals:
             return None
         spread = speed_spread(chunk, floor=floor)
+        if spread <= max_spread:
+            return reversals, spread
         # A reveal that starts from rest necessarily has a huge spread; judging
-        # it by the same ratio as a cruising shot would throw away the reveal.
-        if spread > max_spread and not eases_in(chunk, floor=floor):
-            return None
-        return reversals, spread
+        # it by the same ratio as a cruising shot would throw the reveal away.
+        if allow_ease_in and eases_in(chunk, floor=floor):
+            return reversals, spread
+        return None
 
-    taken: list[Span] = []
-    free = [(0, len(buckets))]
+    def search(allow_ease_in: bool) -> list[Span]:
+        taken: list[Span] = []
+        free = [(0, len(buckets))]
 
-    while free:
-        best: tuple[tuple[int, float, int], int, int, int, float] | None = None
-        for lo, hi in free:
-            for length in range(min(max_len, hi - lo), min_len - 1, -1):
-                for offset in range(lo, hi - length + 1):
-                    result = score(offset, offset + length)
-                    if result is None:
-                        continue
-                    reversals, spread = result
-                    # Prefer longer, then calmer, then earlier.
-                    key = (-length, spread, offset)
-                    if best is None or key < best[0]:
-                        best = (key, length, offset, reversals, spread)
-        if best is None:
-            break
+        while free:
+            best: tuple[tuple[int, float, int], int, int, int, float] | None = None
+            for lo, hi in free:
+                for length in range(min(max_len, hi - lo), min_len - 1, -1):
+                    for offset in range(lo, hi - length + 1):
+                        result = score(offset, offset + length, allow_ease_in)
+                        if result is None:
+                            continue
+                        reversals, spread = result
+                        # Prefer longer, then calmer, then earlier.
+                        key = (-length, spread, offset)
+                        if best is None or key < best[0]:
+                            best = (key, length, offset, reversals, spread)
+            if best is None:
+                break
 
-        _, length, offset, reversals, spread = best
-        taken.append(
-            Span(
-                start=start + offset * bucket_seconds,
-                end=start + (offset + length) * bucket_seconds,
-                reversals=reversals,
-                spread=round(spread, 3),
+            _, length, offset, reversals, spread = best
+            taken.append(
+                Span(
+                    start=start + offset * bucket_seconds,
+                    end=start + (offset + length) * bucket_seconds,
+                    reversals=reversals,
+                    spread=round(spread, 3),
+                )
             )
-        )
-        # Carve the chosen span out of the free list; what is left on either
-        # side can still hold another window if it is long enough.
-        remaining: list[tuple[int, int]] = []
-        for lo, hi in free:
-            if offset >= hi or offset + length <= lo:
-                remaining.append((lo, hi))
-                continue
-            if offset - lo >= min_len:
-                remaining.append((lo, offset))
-            if hi - (offset + length) >= min_len:
-                remaining.append((offset + length, hi))
-        free = remaining
+            # Carve the chosen span out of the free list; what is left on either
+            # side can still hold another window if it is long enough.
+            remaining: list[tuple[int, int]] = []
+            for lo, hi in free:
+                if offset >= hi or offset + length <= lo:
+                    remaining.append((lo, hi))
+                    continue
+                if offset - lo >= min_len:
+                    remaining.append((lo, offset))
+                if hi - (offset + length) >= min_len:
+                    remaining.append((offset + length, hi))
+            free = remaining
+        return taken
 
+    # Strict first, and only fall back to the ease-in exemption when nothing
+    # qualifies without it. The exemption cannot tell a deliberate reveal from a
+    # slow drift that happens to sit below the floor before accelerating away,
+    # because the two have the same shape — so letting it compete on equal terms
+    # loses good footage. On a take that drifted for five seconds and then
+    # settled into a steady orbit, the exempt window ran 5-20 with an 11.6x
+    # spread, straddling both behaviours; the strict search found 16-28 at 1.8x,
+    # which is the orbit its owner actually pointed to. A genuine reveal is
+    # unaffected: nothing qualifies strictly, so the exemption still returns it.
+    taken = search(allow_ease_in=False) or search(allow_ease_in=True)
     return sorted(taken, key=lambda w: w.start)
 
 

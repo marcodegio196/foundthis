@@ -391,6 +391,35 @@ class TestFindWindows(unittest.TestCase):
         )
         self.assertEqual(spans, [])
 
+    def test_the_exemption_does_not_outbid_a_strict_window(self):
+        """A drift that sits below the floor then accelerates has the same shape
+        as a reveal, so the exemption cannot tell them apart. Letting it compete
+        on length lost the good part: measured on a take that drifted for five
+        seconds and then settled into a steady orbit, the exempt window spanned
+        both at 11.6x spread while a strict one sat inside the orbit at 1.8x.
+        """
+        profile = (
+            [0.017] * 5 + [0.007, 0.007, 0.003, 0.002, 0.003, 0.002, 0.014]
+            + [0.044, 0.056, 0.086, 0.097, 0.110, 0.114, 0.116, 0.136, 0.149,
+               0.159, 0.169, 0.170, 0.149, 0.125, 0.103, 0.088, 0.078]
+        )
+        spans = motion.find_windows(
+            profile, start=0.0, min_seconds=10, max_seconds=15, max_spread=3.0
+        )
+        self.assertTrue(spans)
+        for span in spans:
+            self.assertLessEqual(span.spread, 3.0)
+
+    def test_a_reveal_still_wins_when_nothing_else_qualifies(self):
+        """The exemption is a fallback, not a deletion: a genuine reveal has no
+        strict alternative, so it must still come back."""
+        spans = motion.find_windows(
+            TestSpeedCurve.EASE_IN, start=0.0, min_seconds=10, max_seconds=15,
+            max_spread=3.0,
+        )
+        self.assertEqual(len(spans), 1)
+        self.assertGreater(spans[0].spread, 3.0)
+
     def test_longer_window_wins_when_both_are_clean(self):
         spans = motion.find_windows([0.03] * 15, start=0.0, min_seconds=10, max_seconds=15)
         self.assertAlmostEqual(spans[0].duration, 15.0)
