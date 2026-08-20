@@ -242,6 +242,30 @@ def to_runs(samples: Sequence[Sample], labels: Sequence[str]) -> list[Run]:
     return runs
 
 
+def merge_usable_runs(runs: Sequence[Run]) -> list[Run]:
+    """Join neighbouring runs that are both usable.
+
+    Segmentation exists to separate usable footage from repositioning, not to
+    separate one kind of usable footage from another. A drone easing out of a
+    move into a hold is a single take, but the label flips the moment its speed
+    crosses HELD_RATE, and splitting there cut an 13-second shot into a 4.4s
+    piece and a 9.0s piece — neither long enough to post, from footage that was
+    fine.
+
+    The merged run keeps the label of whichever half lasted longer, so `held`
+    and `move` still describe what the shot mostly does.
+    """
+    merged: list[Run] = []
+    for run in runs:
+        if merged and merged[-1].usable and run.usable:
+            previous = merged[-1]
+            longer = previous if previous.duration >= run.duration else run
+            merged[-1] = Run(previous.start, run.end, longer.motion_class)
+        else:
+            merged.append(run)
+    return merged
+
+
 def merge_short_runs(
     runs: Sequence[Run], min_seconds: float, min_reposition_seconds: float = 1.0
 ) -> list[Run]:
@@ -387,8 +411,10 @@ def segment(
     labels = label_samples(
         samples, frame_width, sample_fps, window=window, max_rate=max_rate
     )
-    return merge_short_runs(
-        to_runs(samples, labels), min_seconds, min_reposition_seconds
+    return merge_usable_runs(
+        merge_short_runs(
+            to_runs(samples, labels), min_seconds, min_reposition_seconds
+        )
     )
 
 

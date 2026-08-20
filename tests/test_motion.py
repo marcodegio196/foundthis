@@ -227,6 +227,40 @@ class TestSegment(unittest.TestCase):
     def test_no_samples(self):
         self.assertEqual(motion.segment([], WIDTH, FPS, min_seconds=3.0), [])
 
+    def test_a_move_easing_into_a_hold_stays_one_shot(self):
+        """Crossing HELD_RATE is not a shot boundary.
+
+        Segmentation separates usable footage from repositioning. A drone
+        slowing to a stop is one take, and splitting it where the speed dips
+        below the held threshold turned 13 usable seconds into a 4.4s piece and
+        a 9.0s piece, neither long enough to post.
+        """
+        data = samples([(8, 0)] * 20 + [(0, 0)] * 20)
+        runs = motion.segment(data, WIDTH, FPS, min_seconds=3.0)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].start, 0.0)
+        self.assertAlmostEqual(runs[0].end, data[-1].end)
+
+    def test_repositioning_still_breaks_a_run(self):
+        """Merging usable neighbours must not swallow a hunt between them."""
+        data = samples(
+            [(8, 0)] * 16 + [(30, 0), (-30, 0)] * 8 + [(8, 0)] * 16
+        )
+        classes = [r.motion_class for r in
+                   motion.segment(data, WIDTH, FPS, min_seconds=3.0)]
+        self.assertIn(motion.REPOSITION, classes)
+        self.assertEqual(classes.count(motion.REPOSITION), 1)
+
+    def test_merged_run_keeps_the_label_of_its_longer_half(self):
+        Run = motion.Run
+        merged = motion.merge_usable_runs([
+            Run(0.0, 2.0, motion.MOVE),
+            Run(2.0, 12.0, motion.HELD),
+        ])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].motion_class, motion.HELD)
+        self.assertEqual((merged[0].start, merged[0].end), (0.0, 12.0))
+
 
 class TestSpeedCurve(unittest.TestCase):
     """Speed steadiness — the thing `jitter` cannot see.

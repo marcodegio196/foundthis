@@ -187,21 +187,40 @@ def carve_windows(
     # thousands of sub-second rows behind.
     sliver = motion.SPEED_BUCKET_SECONDS
 
+    def still_steady(start: float, end: float) -> bool:
+        """Does the window survive being widened to these bounds?
+
+        Absorbing a stray fraction of a second is only safe if it does not drag
+        in a defect. It did: a sub-bucket gap in front of a window pulled the
+        neighbouring second along with it, and that second held the lurch the
+        window had been placed to avoid — producing a shot that carried a speed
+        reversal despite the search only ever accepting windows without one.
+        """
+        return motion.speed_reversals(slice_profile(start, end)) == 0
+
     out: list[tuple[float, float, str, list[float], bool]] = []
     cursor = run.start
     for win in windows:
-        if win.start - cursor > sliver:
-            out.append(
-                (cursor, win.start, run.motion_class, slice_profile(cursor, win.start), False)
-            )
-            cursor = win.start
+        start = win.start
+        # A gap too small to stand alone is folded into the window, but only
+        # when the widened window is still clean. Otherwise it is emitted as a
+        # leftover however short it is: a stray row in the database costs
+        # nothing, a lurch inside a published clip costs the post.
+        if cursor < start:
+            if start - cursor > sliver or not still_steady(cursor, win.end):
+                out.append(
+                    (cursor, start, run.motion_class, slice_profile(cursor, start), False)
+                )
+            else:
+                start = cursor
+
         end = min(win.end, run.end)
-        # Absorb a short tail into this window rather than emitting it alone.
-        if run.end - end <= sliver:
+        if run.end - end <= sliver and still_steady(start, run.end):
             end = run.end
-        out.append((cursor, end, run.motion_class, slice_profile(cursor, end), True))
+        out.append((start, end, run.motion_class, slice_profile(start, end), True))
         cursor = end
-    if run.end - cursor > sliver:
+
+    if run.end - cursor > 0.01:
         out.append(
             (cursor, run.end, run.motion_class, slice_profile(cursor, run.end), False)
         )
