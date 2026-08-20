@@ -235,3 +235,72 @@ class TestRenderCommands(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOverlayContrast(unittest.TestCase):
+    """Picking the text colour from what is actually behind it."""
+
+    def test_bright_backdrop_flips_the_text_to_black(self):
+        self.assertEqual(render.overlay_palette(0.85), ("black", "white@0.55"))
+
+    def test_dark_backdrop_keeps_white(self):
+        self.assertEqual(render.overlay_palette(0.20), ("white", "black@0.55"))
+
+    def test_unmeasurable_backdrop_keeps_white(self):
+        """A failed measurement must not change how the feed looks."""
+        self.assertEqual(render.overlay_palette(None), ("white", "black@0.55"))
+
+    def test_brightness_uses_a_percentile_not_the_mean(self):
+        """A bright patch beside a dark one is the case that fails.
+
+        Averaging hides it: this strip means out below the threshold while a
+        quarter of it is near-white, which is exactly where the glyphs went.
+        """
+        patchy = bytes([20] * 12 + [230] * 4)
+        self.assertLess(sum(patchy) / len(patchy) / 255, render.LIGHT_BACKDROP)
+        self.assertGreater(render.backdrop_brightness(patchy), render.LIGHT_BACKDROP)
+
+    def test_brightness_of_nothing_is_unmeasurable(self):
+        self.assertIsNone(render.backdrop_brightness(b""))
+
+    def test_uniform_backdrop_reads_as_itself(self):
+        self.assertAlmostEqual(render.backdrop_brightness(bytes([128] * 16)), 128 / 255)
+
+    def test_luma_command_measures_the_cropped_frame(self):
+        """The strip is sampled after the 9:16 crop, or it reports on parts of
+        the source the viewer never sees."""
+        command = render.build_overlay_luma_command(
+            "a.mp4", in_point=0.0, out_point=5.0, width=3840, height=2160
+        )
+        graph = command[command.index("-vf") + 1]
+        self.assertIn("crop=1214:2160", graph)
+        self.assertIn("format=gray", graph)
+        self.assertEqual(command[-1], "-")
+
+    def test_luma_command_samples_the_text_band(self):
+        command = render.build_overlay_luma_command(
+            "a.mp4", in_point=0.0, out_point=5.0, width=1080, height=1920
+        )
+        graph = command[command.index("-vf") + 1]
+        top, bottom = render.OVERLAY_BAND
+        self.assertIn(f"ih*{bottom - top:.3f}", graph)
+        self.assertLessEqual(top, render.OVERLAY_BASE_Y)
+
+    def test_social_command_carries_the_chosen_colours(self):
+        command = render.build_social_command(
+            "a.mp4", "out.mp4", in_point=0.0, out_point=1.0,
+            width=1080, height=1920, lines=["Found this."],
+            font_color="black", shadow_color="white@0.55",
+        )
+        graph = command[command.index("-vf") + 1]
+        self.assertIn("fontcolor=black", graph)
+        self.assertIn("shadowcolor=white@0.55", graph)
+
+    def test_social_command_defaults_to_white(self):
+        command = render.build_social_command(
+            "a.mp4", "out.mp4", in_point=0.0, out_point=1.0,
+            width=1080, height=1920, lines=["Found this."],
+        )
+        graph = command[command.index("-vf") + 1]
+        self.assertIn("fontcolor=white", graph)
+

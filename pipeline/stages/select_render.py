@@ -171,6 +171,31 @@ def clip_bounds(row: db.Row, cfg: Config = default_config) -> tuple[float, float
     return in_point, out_point
 
 
+def measure_backdrop(
+    row: db.Row, in_point: float, out_point: float
+) -> float | None:
+    """Mean brightness behind the overlay, or None if it cannot be measured.
+
+    A failure here must not lose the render: the clip is still fine, it just
+    falls back to white text, so this swallows media errors rather than letting
+    one unreadable frame take the whole shot down.
+    """
+    try:
+        raw = media.run_bytes(
+            render.build_overlay_luma_command(
+                row["source_path"],
+                in_point=in_point,
+                out_point=out_point,
+                width=row["source_width"] or 0,
+                height=row["source_height"] or 0,
+            )
+        )
+    except media.MediaError as exc:
+        log.warning("could not measure the backdrop for shot %s: %s", row["id"], exc)
+        return None
+    return render.backdrop_brightness(raw)
+
+
 def render_shot(
     conn: sqlite3.Connection,
     row: db.Row,
@@ -196,6 +221,9 @@ def render_shot(
         target = target_for(cfg.social_render_dir)
         target.parent.mkdir(parents=True, exist_ok=True)
         lines = overlay_for(row, cfg)
+        font_color, shadow_color = render.overlay_palette(
+            measure_backdrop(row, in_point, out_point)
+        )
         media.run(
             render.build_social_command(
                 row["source_path"], target,
@@ -203,6 +231,8 @@ def render_shot(
                 width=row["source_width"] or 0, height=row["source_height"] or 0,
                 lines=lines,
                 font_file=cfg.overlay_font,
+                font_color=font_color,
+                shadow_color=shadow_color,
             ),
             capture=True,
         )

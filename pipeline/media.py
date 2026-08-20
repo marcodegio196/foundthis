@@ -41,6 +41,22 @@ def run(cmd: list[str], *, capture: bool = True) -> str:
     return result.stdout if capture else ""
 
 
+def run_bytes(cmd: list[str]) -> bytes:
+    """Run a command and return stdout as bytes.
+
+    `run` decodes as text, which corrupts anything binary. Used for filters
+    that emit raw pixels rather than a report.
+    """
+    try:
+        result = subprocess.run(cmd, capture_output=True, check=True)
+    except FileNotFoundError as exc:
+        raise MediaError(f"{cmd[0]} not found on PATH") from exc
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise MediaError(f"{cmd[0]} failed: {' / '.join(tail)}") from exc
+    return result.stdout
+
+
 # ---------------------------------------------------------------------------
 # Probing
 # ---------------------------------------------------------------------------
