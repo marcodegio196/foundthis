@@ -86,8 +86,24 @@ def cmd_queue(args: argparse.Namespace) -> int:
 def cmd_approve(args: argparse.Namespace) -> int:
     from .stages import select_render
 
+    if bool(args.shot_ids) == bool(args.auto):
+        print("give shot ids, or --auto N — not both", file=sys.stderr)
+        return 2
+
     conn = _open(args)
     try:
+        if args.auto:
+            proposed = select_render.auto_approve(conn, args.auto, cfg=config)
+            if not proposed:
+                print("nothing to approve")
+                return 0
+            for row, reason in proposed:
+                print(
+                    f"{row['id']:>6}  {(row['country'] or '?'):<14} "
+                    f"{row['duration']:>5.1f}s  {reason}"
+                )
+            print(f"approved {len(proposed)} shot(s)")
+            return 0
         count = select_render.approve(conn, args.shot_ids)
     finally:
         conn.close()
@@ -170,6 +186,88 @@ def cmd_export(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def cmd_purge(args: argparse.Namespace) -> int:
+    from .stages import purge
+
+    conn = _open(args, read_only=args.dry_run)
+    try:
+        if args.list:
+            rows = purge.eligible_sources(conn, args.limit)
+            if not rows:
+                print("nothing eligible to purge")
+                return 0
+            total = 0
+            for row in rows:
+                size = row["size_bytes"] or 0
+                total += size
+                print(f"{row['id']:>6}  {row['relpath']:<60} {size / 1e6:>8.1f} MB")
+            print(f"\n{len(rows)} source(s), {total / 1e9:.2f} GB")
+            return 0
+
+        counts = purge.run(conn, config, limit=args.limit, dry_run=args.dry_run)
+        if args.dry_run:
+            print(
+                f"purge (dry run): {counts['purged']} source(s) eligible — "
+                "re-run with --yes to actually delete"
+            )
+        else:
+            return _report("purge", counts)
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from .stages import distribute
+
+    conn = _open(args, read_only=args.list)
+    try:
+        if args.list:
+            rows = conn.execute(
+                "SELECT id, country, scheduled_at FROM shot_details "
+                "WHERE scheduled_at IS NOT NULL AND posted_at IS NULL "
+                "ORDER BY scheduled_at"
+            ).fetchall()
+            if not rows:
+                print("nothing scheduled")
+                return 0
+            for row in rows:
+                print(f"{row['id']:>6}  {row['scheduled_at']}  {row['country'] or '?'}")
+            return 0
+
+        start_at = None
+        if args.start:
+            start_at = datetime.fromisoformat(args.start)
+            if start_at.tzinfo is None:
+                start_at = start_at.replace(tzinfo=timezone.utc)
+
+        scheduled = distribute.schedule_pending(
+            conn, config,
+            count=args.count, interval_hours=args.interval_hours, start_at=start_at,
+        )
+        if not scheduled:
+            print("nothing ready to schedule (needs to be rendered, approved, and not yet posted)")
+            return 0
+        for row, when in scheduled:
+            print(f"{row['id']:>6}  {when.strftime('%Y-%m-%d %H:%M')} UTC  {row['country'] or '?'}")
+        print(f"scheduled {len(scheduled)} shot(s)")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    from .stages import distribute
+
+    conn = _open(args)
+    try:
+        return _report("upload", distribute.upload_pending(conn, config, limit=args.limit))
+    finally:
+        conn.close()
+
+
 def cmd_publish(args: argparse.Namespace) -> int:
     from .stages import distribute
 
@@ -236,7 +334,11 @@ def build_parser() -> argparse.ArgumentParser:
     queue.set_defaults(func=cmd_queue)
 
     approve = sub.add_parser("approve", help="stage 4: approve shots for rendering")
-    approve.add_argument("shot_ids", type=int, nargs="+")
+    approve.add_argument("shot_ids", type=int, nargs="*")
+    approve.add_argument(
+        "--auto", type=int, metavar="N",
+        help="approve the N shots the diversity rules propose, with no review",
+    )
     approve.set_defaults(func=cmd_approve)
 
     render = sub.add_parser("render", help="stage 4: render approved shots")
@@ -254,6 +356,44 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--limit", type=int)
     export.add_argument("--dry-run", action="store_true", help="report without writing")
     export.set_defaults(func=cmd_export)
+
+    purge = sub.add_parser(
+        "purge",
+        help="delete local raw sources whose shots are all rendered or rejected "
+        "(the cloud copy is assumed to already exist)",
+    )
+    purge.add_argument("--limit", type=int)
+    purge.add_argument(
+        "--list", action="store_true", help="show what's eligible, delete nothing"
+    )
+    purge.add_argument(
+        "--yes", dest="dry_run", action="store_false",
+        help="actually delete files (default is a dry run)",
+    )
+    purge.set_defaults(func=cmd_purge, dry_run=True)
+
+    schedule = sub.add_parser(
+        "schedule", help="stage 5: assign future posting times to rendered shots"
+    )
+    schedule.add_argument("--count", type=int, help="how many shots to schedule (default: all ready)")
+    schedule.add_argument(
+        "--interval-hours", type=float, default=None,
+        help=f"spacing between posts (default {config.post_interval_hours}h)",
+    )
+    schedule.add_argument(
+        "--start", help="ISO timestamp for the first post (default: after what's "
+        "already scheduled, or now)",
+    )
+    schedule.add_argument(
+        "--list", action="store_true", help="show the current schedule, assign nothing"
+    )
+    schedule.set_defaults(func=cmd_schedule)
+
+    upload = sub.add_parser(
+        "upload", help="stage 5: host rendered clips on Zernio ahead of posting them"
+    )
+    upload.add_argument("--limit", type=int)
+    upload.set_defaults(func=cmd_upload)
 
     publish = sub.add_parser("publish", help="stage 5: post via Zernio, then check delivery")
     publish.add_argument("--limit", type=int)

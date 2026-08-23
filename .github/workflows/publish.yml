@@ -1,0 +1,49 @@
+name: publish
+
+# Posts whatever is due and nothing else. Cadence is decided by `schedule`
+# (shots.scheduled_at) locally, not by this cron — this just has to run
+# often enough that a due post doesn't wait long once its slot arrives.
+# Every 6h is a safety margin, not the posting interval itself.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No requirements.txt install on purpose: `publish` only ever imports
+      # pipeline/db.py, config.py, zernio.py and stages/distribute.py, none
+      # of which touch torch/opencv/scenedetect — those are stage 1-3 only.
+      - name: Post whatever's due, then check delivery
+        env:
+          ZERNIO_API_KEY: ${{ secrets.ZERNIO_API_KEY }}
+          ZERNIO_BASE_URL: ${{ secrets.ZERNIO_BASE_URL }}
+          ZERNIO_PROFILE_ID: ${{ secrets.ZERNIO_PROFILE_ID }}
+        run: python -m pipeline.cli -v publish --limit 1
+
+      # `publish` writes posted_at / delivery_status / scheduled_at back to
+      # pipeline.db. Committing it is how the next run (and you, looking at
+      # the repo) knows what already went out — this is the only state this
+      # job has, there's no other database behind it.
+      - name: Commit the updated database
+        run: |
+          git config user.name "pipeline-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -f pipeline.db
+          git diff --cached --quiet || git commit -m "publish: update pipeline state [skip ci]"
+          git push

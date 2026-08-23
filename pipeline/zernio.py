@@ -303,16 +303,7 @@ class ZernioClient:
 
     # -- posts -------------------------------------------------------------
 
-    def publish(
-        self,
-        video_path: str | Path,
-        caption: str,
-        *,
-        platforms: Sequence[str] | None = None,
-        cover_frame_ms: int | None = None,
-    ) -> dict[str, Any]:
-        """Upload the render and publish it now. Returns the Zernio response."""
-        video_path = Path(video_path)
+    def _resolve_platforms(self, platforms: Sequence[str] | None) -> dict[str, str]:
         connected = self.accounts()
         wanted = (
             {p: connected[p] for p in platforms if p in connected}
@@ -324,17 +315,57 @@ class ZernioClient:
                 "no connected Zernio accounts"
                 + (f" for {', '.join(platforms)}" if platforms else "")
             )
+        return wanted
 
-        media_url = self.upload_media(video_path)
+    def publish_url(
+        self,
+        media_url: str,
+        caption: str,
+        *,
+        media_type: str = "video",
+        platforms: Sequence[str] | None = None,
+        cover_frame_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Publish media that is already hosted — no upload, no local file.
+
+        This is what a runner with no access to the render (a cloud publish
+        job, say) calls: the video was uploaded to Zernio's storage ahead of
+        time by `upload_media`, and only the resulting URL travels with the
+        shot from then on.
+        """
+        wanted = self._resolve_platforms(platforms)
         body = build_post_body(
             caption=caption,
             accounts=wanted,
             media_url=media_url,
-            media_type=media_item_type(video_path.name),
+            media_type=media_type,
             profile_id=self.profile_id,
             cover_frame_ms=cover_frame_ms,
         )
         return self._call("POST", "/posts", payload=body, timeout=UPLOAD_TIMEOUT)
+
+    def publish(
+        self,
+        video_path: str | Path,
+        caption: str,
+        *,
+        platforms: Sequence[str] | None = None,
+        cover_frame_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Upload the render and publish it now. Returns the Zernio response."""
+        video_path = Path(video_path)
+        # Resolved (and, if unconnected, raised) before touching the network
+        # for the upload — a platform typo should fail without spending an
+        # upload on it.
+        self._resolve_platforms(platforms)
+        media_url = self.upload_media(video_path)
+        return self.publish_url(
+            media_url,
+            caption,
+            media_type=media_item_type(video_path.name),
+            platforms=platforms,
+            cover_frame_ms=cover_frame_ms,
+        )
 
     def fetch_post(self, post_id: str) -> dict[str, Any] | None:
         """GET /posts/{id}, unwrapping the `post` envelope Zernio uses."""

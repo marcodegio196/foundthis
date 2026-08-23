@@ -62,6 +62,11 @@ in frame, where, and how the camera moves. No marketing language, no "this \
 video shows".
 - `person_in_frame` is true only if a human figure is identifiable, however \
 small.
+- `subject_offset_x` is the horizontal position (0 = left edge, 1 = right \
+edge, 0.5 = centre) of a moving vehicle or person that the shot is clearly \
+tracking, averaged across the frames shown. Return null when there is no such \
+subject — most aerial landscape shots have nothing to track, and this must \
+stay null rather than a guessed centre.
 - `inferred_site` is a specific named place (a town, beach, peak, or landmark) \
 only when the imagery genuinely identifies it. Return null when you would be \
 guessing — a wrong location is worse than none in a licensing catalog."""
@@ -83,6 +88,16 @@ RESPONSE_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "True if any identifiable human figure appears.",
         },
+        "subject_offset_x": {
+            "anyOf": [
+                {"type": "number", "minimum": 0, "maximum": 1},
+                {"type": "null"},
+            ],
+            "description": (
+                "Horizontal position (0=left, 1=right) of a tracked vehicle or "
+                "person, or null if there's nothing the shot is tracking."
+            ),
+        },
         "description": {
             "type": "string",
             "description": "One sentence: subject, setting, and camera movement.",
@@ -93,7 +108,8 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [
-        "subject_tags", "mood_tags", "person_in_frame", "description", "inferred_site",
+        "subject_tags", "mood_tags", "person_in_frame", "subject_offset_x",
+        "description", "inferred_site",
     ],
     "additionalProperties": False,
 }
@@ -245,6 +261,7 @@ def run(
                 subject_tags=result["subject_tags"],
                 mood_tags=result["mood_tags"],
                 person_in_frame=int(result["person_in_frame"]),
+                subject_offset_x=result["subject_offset_x"],
                 description=result["description"],
                 inferred_site=result["inferred_site"],
                 tagged_at=db.now(),

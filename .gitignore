@@ -29,3 +29,6 @@ archive/
 .DS_Store
 .idea/
 .vscode/
+
+# Log delle esecuzioni pianificate
+logs/

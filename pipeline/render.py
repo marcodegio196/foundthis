@@ -53,12 +53,20 @@ def vertical_output_size(output_height: int) -> tuple[int, int]:
     return _even(output_height * VERTICAL_ASPECT), _even(output_height)
 
 
-def crop_to_vertical(width: int, height: int) -> str | None:
-    """Centre-crop filter bringing a source to 9:16, or None if it already is.
+def crop_to_vertical(
+    width: int, height: int, offset_x: float | None = None
+) -> str | None:
+    """Crop filter bringing a source to 9:16, or None if it already is.
 
     Cropping 16:9 to 9:16 keeps only the middle ~32% of the frame, so a shot
     whose subject sits off-centre is better served by a native 9:16 master —
     which is why the selection query prefers those.
+
+    `offset_x` is the tracked subject's horizontal position (0=left edge,
+    1=right edge), from stage 3's tagging pass. Passing None keeps the crop
+    centred, which is also what a plain landscape shot with nothing to track
+    wants — this only shifts the window when there's actually a car or person
+    to keep in frame.
 
     The crop cannot always land on exactly 9:16: a 720-tall source wants a
     405-wide crop, and odd widths break yuv420p. The residual fraction of a
@@ -70,7 +78,12 @@ def crop_to_vertical(width: int, height: int) -> str | None:
     if abs(ratio - VERTICAL_ASPECT) < 0.001:
         return None
     if ratio > VERTICAL_ASPECT:  # landscape or square: trim the sides
-        return f"crop={min(_even(height * VERTICAL_ASPECT), _even(width))}:{_even(height)}"
+        crop_w = min(_even(height * VERTICAL_ASPECT), _even(width))
+        crop_h = _even(height)
+        if offset_x is None:
+            return f"crop={crop_w}:{crop_h}"
+        x = int(round(min(max(offset_x * width - crop_w / 2, 0), width - crop_w)))
+        return f"crop={crop_w}:{crop_h}:{x}:0"
     # Taller than 9:16 (rare): trim top and bottom instead of overcropping.
     return f"crop={_even(width)}:{min(_even(width / VERTICAL_ASPECT), _even(height))}"
 
@@ -110,6 +123,7 @@ def build_overlay_luma_command(
     height: int,
     sample_fps: float = 2.0,
     band: tuple[float, float] = OVERLAY_BAND,
+    offset_x: float | None = None,
 ) -> list[str]:
     """Emit one grey byte per sampled frame: the mean brightness behind the text.
 
@@ -122,7 +136,7 @@ def build_overlay_luma_command(
     edges are backdrop the reader never sees behind a glyph.
     """
     top, bottom = band
-    filters = [f for f in (crop_to_vertical(width, height),) if f]
+    filters = [f for f in (crop_to_vertical(width, height, offset_x),) if f]
     filters.append(
         f"crop=iw*0.7:ih*{bottom - top:.3f}:iw*0.15:ih*{top:.3f}"
     )
@@ -179,10 +193,11 @@ def build_social_command(
     output_height: int = 1920,
     font_color: str = "white",
     shadow_color: str = "black@0.55",
+    offset_x: float | None = None,
 ) -> list[str]:
     """9:16, overlay burned in, compressed for platform delivery."""
     out_width, out_height = vertical_output_size(output_height)
-    filters = [f for f in (crop_to_vertical(width, height),) if f]
+    filters = [f for f in (crop_to_vertical(width, height, offset_x),) if f]
     # Pinned to exact dimensions rather than derived with -2: a source whose
     # crop can't land on exactly 9:16 would otherwise produce something like
     # 1078x1920, which platforms re-encode. setsar=1 stops a non-square pixel

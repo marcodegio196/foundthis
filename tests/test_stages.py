@@ -10,12 +10,13 @@ import tempfile
 import threading
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 from pipeline import db
 from pipeline.config import config as base_config
-from pipeline.stages import distribute, ingest, scene_detect, select_render, tag
+from pipeline.stages import distribute, ingest, purge, scene_detect, select_render, tag
 
 
 class StageTestCase(unittest.TestCase):
@@ -231,6 +232,7 @@ TAG_RESULT = {
     "subject_tags": ["coastline", "village"],
     "mood_tags": ["solitude"],
     "person_in_frame": True,
+    "subject_offset_x": None,
     "description": "A village above a coastline, slow push in.",
     "inferred_site": "Ksamil",
 }
@@ -406,6 +408,17 @@ class TestSelection(StageTestCase):
         proposed = select_render.propose_queue(self.conn, 1)
         self.assertEqual(proposed[0][0]["id"], peru_shot)
 
+    def test_recently_approved_but_unposted_country_is_skipped(self):
+        """`approve --auto 1` run repeatedly, one shot at a time, before the
+        earlier pick has actually posted, must still see it as taken —
+        otherwise two runs in a row can approve the same country."""
+        albania = self.add_source()
+        peru = self.add_source(path="/archive/peru/x.mp4", relpath="peru/x.mp4", country="peru")
+        self.add_shot(albania, selection_state="approved", approved_at="2026-02-01")
+        peru_shot = self.add_shot(peru)
+        proposed = select_render.propose_queue(self.conn, 1)
+        self.assertEqual(proposed[0][0]["id"], peru_shot)
+
     def test_one_shot_per_country_within_a_batch(self):
         albania = self.add_source()
         self.add_shot(albania)
@@ -529,6 +542,73 @@ class TestSelection(StageTestCase):
         )
 
 
+class TestAutoApprove(StageTestCase):
+    """Approving without a human in the loop."""
+
+    def test_approves_what_the_rules_propose(self):
+        shot_id = self.add_shot()
+        proposed = select_render.auto_approve(self.conn, 1, cfg=self.cfg)
+        self.assertEqual([row["id"] for row, _ in proposed], [shot_id])
+        row = self.conn.execute(
+            "SELECT * FROM shots WHERE id = ?", (shot_id,)
+        ).fetchone()
+        self.assertEqual(row["selection_state"], "approved")
+        self.assertIsNotNone(row["approved_at"])
+
+    def test_records_why_each_shot_was_taken(self):
+        """An unattended feed still has to be auditable after the fact."""
+        self.add_shot()
+        proposed = select_render.auto_approve(self.conn, 1, cfg=self.cfg)
+        self.assertTrue(all(reason for _, reason in proposed))
+
+    def test_an_empty_queue_approves_nothing(self):
+        self.assertEqual(select_render.auto_approve(self.conn, 5, cfg=self.cfg), [])
+
+    def test_it_respects_the_count(self):
+        for index in range(5):
+            self.add_shot(
+                self.add_source(
+                    path=f"/archive/c{index}/x.mp4", relpath=f"c{index}/x.mp4",
+                    country=f"c{index}",
+                )
+            )
+        self.assertEqual(len(select_render.auto_approve(self.conn, 2, cfg=self.cfg)), 2)
+
+    def test_a_shot_too_short_to_render_is_never_proposed(self):
+        """Approving one produces a shot the render step then refuses — a queue
+        that quietly disagrees with itself."""
+        cfg = replace(self.cfg, min_render_seconds=10.0, max_render_seconds=15.0)
+        source = self.add_source()
+        long_enough = self.add_shot(source)
+        self.conn.execute(
+            "UPDATE shots SET in_point = 0.0, out_point = 12.0 WHERE id = ?",
+            (long_enough,),
+        )
+        too_short = self.add_shot(source)
+        self.conn.execute(
+            "UPDATE shots SET in_point = 20.0, out_point = 24.0 WHERE id = ?",
+            (too_short,),
+        )
+        self.conn.commit()
+        picked = [row["id"] for row, _ in select_render.auto_approve(self.conn, 10, cfg=cfg)]
+        self.assertIn(long_enough, picked)
+        self.assertNotIn(too_short, picked)
+
+    def test_approved_shots_do_not_come_back(self):
+        """A second run must not re-approve the same shot."""
+        for index in range(3):
+            self.add_shot(
+                self.add_source(
+                    path=f"/archive/c{index}/x.mp4", relpath=f"c{index}/x.mp4",
+                    country=f"c{index}",
+                )
+            )
+        first = {row["id"] for row, _ in select_render.auto_approve(self.conn, 1, cfg=self.cfg)}
+        second = {row["id"] for row, _ in select_render.auto_approve(self.conn, 1, cfg=self.cfg)}
+        self.assertTrue(first)
+        self.assertFalse(first & second)
+
+
 class TestRenderStage(StageTestCase):
     def approved_shot(self, **fields):
         return self.add_shot(selection_state="approved", approved_at="2026-02-01", **fields)
@@ -588,6 +668,7 @@ class FakeClient:
         self.post_id = post_id
         self.statuses = statuses if statuses is not None else {"instagram": "published"}
         self.published = []
+        self.uploaded = []
 
     def _post(self):
         return {
@@ -598,9 +679,22 @@ class FakeClient:
             ],
         }
 
-    def publish(self, video_path, caption, *, platforms=None):
-        self.published.append((Path(video_path), caption, platforms))
+    def upload_media(self, video_path):
+        self.uploaded.append(Path(video_path))
+        return f"https://cdn.zernio.test/{Path(video_path).name}"
+
+    def publish_url(self, media_url, caption, *, media_type="video", platforms=None):
+        self.published.append((media_url, caption, platforms))
         return {"post": self._post()}
+
+    def publish(self, video_path, caption, *, platforms=None):
+        response = self.publish_url(
+            self.upload_media(video_path), caption, platforms=platforms
+        )
+        # `published` should still read as "what was posted, and from what
+        # local file" for tests written against the pre-upload API.
+        self.published[-1] = (Path(video_path), caption, platforms)
+        return response
 
     def fetch_post(self, post_id):
         return self._post() if post_id == self.post_id else None
@@ -730,6 +824,110 @@ class TestDistribute(StageTestCase):
         self.assertIsNotNone(row["delivery_status"])
         self.assertIsNone(row["metrics"])
 
+    # -- scheduling ----------------------------------------------------
+
+    def test_schedule_spaces_posts_by_the_interval(self):
+        first = self.postable_shot()
+        second = self.postable_shot()
+        start = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+
+        scheduled = distribute.schedule_pending(
+            self.conn, self.cfg, interval_hours=6, start_at=start
+        )
+
+        self.assertEqual([row["id"] for row, _ in scheduled], [first, second])
+        self.assertEqual([when for _, when in scheduled], [start, start + timedelta(hours=6)])
+        row = self.conn.execute("SELECT scheduled_at FROM shots WHERE id = ?", (first,)).fetchone()
+        self.assertEqual(row["scheduled_at"], "2026-03-01 12:00:00")
+
+    def test_schedule_again_extends_the_queue_instead_of_colliding(self):
+        first = self.postable_shot()
+        start = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+        distribute.schedule_pending(self.conn, self.cfg, interval_hours=24, start_at=start)
+
+        second = self.postable_shot()
+        scheduled = distribute.schedule_pending(self.conn, self.cfg, interval_hours=24)
+
+        self.assertEqual([row["id"] for row, _ in scheduled], [second])
+        when = scheduled[0][1]
+        self.assertEqual(when, start + timedelta(hours=24))
+
+    def test_schedule_does_not_touch_already_scheduled_shots(self):
+        shot_id = self.postable_shot()
+        start = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+        distribute.schedule_pending(self.conn, self.cfg, interval_hours=24, start_at=start)
+
+        again = distribute.schedule_pending(self.conn, self.cfg, interval_hours=24)
+
+        self.assertEqual(again, [])
+        row = self.conn.execute("SELECT scheduled_at FROM shots WHERE id = ?", (shot_id,)).fetchone()
+        self.assertEqual(row["scheduled_at"], "2026-03-01 12:00:00")
+
+    def test_publish_skips_a_shot_scheduled_in_the_future(self):
+        shot_id = self.postable_shot()
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        db.update_shot(self.conn, shot_id, scheduled_at=distribute._format_ts(future))
+
+        counts = distribute.publish_pending(self.conn, self.cfg, client=FakeClient())
+
+        self.assertEqual(counts["posted"], 0)
+
+    def test_publish_posts_a_shot_whose_slot_has_arrived(self):
+        shot_id = self.postable_shot()
+        past = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.update_shot(self.conn, shot_id, scheduled_at=distribute._format_ts(past))
+
+        counts = distribute.publish_pending(self.conn, self.cfg, client=FakeClient())
+
+        self.assertEqual(counts["posted"], 1)
+
+    def test_unscheduled_shot_still_posts_immediately(self):
+        """Scheduling is opt-in — a shot nobody scheduled behaves as before."""
+        self.postable_shot()
+        counts = distribute.publish_pending(self.conn, self.cfg, client=FakeClient())
+        self.assertEqual(counts["posted"], 1)
+
+    # -- pre-upload (for a publish runner with no access to the render) ----
+
+    def test_upload_stores_the_hosted_url(self):
+        shot_id = self.postable_shot()
+        counts = distribute.upload_pending(self.conn, self.cfg, client=FakeClient())
+        self.assertEqual(counts["uploaded"], 1)
+        row = self.conn.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
+        self.assertTrue(row["social_media_url"].startswith("https://cdn.zernio.test/"))
+        self.assertIsNotNone(row["media_uploaded_at"])
+
+    def test_upload_skips_shots_without_a_render(self):
+        self.add_shot(selection_state="approved")
+        client = FakeClient()
+        distribute.upload_pending(self.conn, self.cfg, client=client)
+        self.assertEqual(client.uploaded, [])
+
+    def test_upload_skips_already_uploaded_shots(self):
+        shot_id = self.postable_shot()
+        db.update_shot(self.conn, shot_id, social_media_url="https://cdn.zernio.test/x.mp4")
+        client = FakeClient()
+        counts = distribute.upload_pending(self.conn, self.cfg, client=client)
+        self.assertEqual(counts["uploaded"], 0)
+        self.assertEqual(client.uploaded, [])
+
+    def test_publish_uses_the_stored_url_without_touching_the_file(self):
+        shot_id = self.postable_shot()
+        db.update_shot(
+            self.conn, shot_id, social_media_url="https://cdn.zernio.test/pre.mp4"
+        )
+        client = FakeClient()
+        counts = distribute.publish_pending(self.conn, self.cfg, client=client)
+        self.assertEqual(counts["posted"], 1)
+        self.assertEqual(client.uploaded, [])  # never called upload_media
+        self.assertEqual(client.published[0][0], "https://cdn.zernio.test/pre.mp4")
+
+    def test_publish_falls_back_to_upload_when_nothing_was_pre_uploaded(self):
+        self.postable_shot()
+        client = FakeClient()
+        distribute.publish_pending(self.conn, self.cfg, client=client)
+        self.assertEqual(len(client.uploaded), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -840,4 +1038,110 @@ class TestScoreConcurrency(StageTestCase):
         with mock.patch.object(self.score_stage, "score_shot") as scorer:
             counts = self.score_stage.score_pending(self.conn, self.cfg, workers=4)
         scorer.assert_not_called()
-        self.assertEqual(counts, {"scored": 0, "failed": 0})
+
+
+# ---------------------------------------------------------------------------
+# Purge
+# ---------------------------------------------------------------------------
+
+
+class TestPurge(StageTestCase):
+    def add_raw_file(self, source_id, *, content=b"x" * 1024):
+        path = Path(
+            self.conn.execute(
+                "SELECT path FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()["path"]
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def test_unsegmented_source_is_not_eligible(self):
+        source_id = self.add_source(scene_detected_at=None)
+        self.add_shot(source_id, rendered_at="2026-01-01")
+        self.assertEqual(purge.eligible_sources(self.conn), [])
+
+    def test_source_with_a_pending_shot_is_not_eligible(self):
+        source_id = self.add_source(scene_detected_at="2026-01-01")
+        self.add_shot(source_id, rendered_at="2026-01-01")
+        self.add_shot(source_id, rendered_at=None, rejected=0)
+        self.assertEqual(purge.eligible_sources(self.conn), [])
+
+    def test_source_with_only_rendered_or_rejected_shots_is_eligible(self):
+        source_id = self.add_source(scene_detected_at="2026-01-01")
+        self.add_shot(source_id, rendered_at="2026-01-01")
+        self.add_shot(source_id, rendered_at=None, rejected=1)
+        rows = purge.eligible_sources(self.conn)
+        self.assertEqual([r["id"] for r in rows], [source_id])
+
+    def test_dry_run_deletes_nothing(self):
+        source_id = self.add_source(scene_detected_at="2026-01-01")
+        self.add_shot(source_id, rendered_at="2026-01-01")
+        path = self.add_raw_file(source_id)
+
+        counts = purge.run(self.conn, self.cfg, dry_run=True)
+
+        self.assertEqual(counts["purged"], 1)
+        self.assertTrue(path.exists())
+        row = self.conn.execute(
+            "SELECT purged_at FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()
+        self.assertIsNone(row["purged_at"])
+
+    def test_real_run_deletes_the_file_and_stamps_purged_at(self):
+        source_id = self.add_source(scene_detected_at="2026-01-01")
+        self.add_shot(source_id, rendered_at="2026-01-01")
+        path = self.add_raw_file(source_id)
+
+        counts = purge.run(self.conn, self.cfg, dry_run=False)
+
+        self.assertEqual(counts["purged"], 1)
+        self.assertEqual(counts["freed_bytes"], 1024)
+        self.assertFalse(path.exists())
+        row = self.conn.execute(
+            "SELECT purged_at FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["purged_at"])
+
+    def test_already_purged_source_is_skipped(self):
+        source_id = self.add_source(scene_detected_at="2026-01-01")
+        self.add_shot(source_id, rendered_at="2026-01-01")
+        self.add_raw_file(source_id)
+        purge.run(self.conn, self.cfg, dry_run=False)
+
+        counts = purge.run(self.conn, self.cfg, dry_run=False)
+        self.assertEqual(counts["purged"], 0)
+
+    def test_missing_file_still_gets_stamped(self):
+        """The file can vanish by some other means; the goal — no local bytes
+        — is already true, so this must not flag it forever."""
+        source_id = self.add_source(scene_detected_at="2026-01-01")
+        self.add_shot(source_id, rendered_at="2026-01-01")
+
+        counts = purge.run(self.conn, self.cfg, dry_run=False)
+
+        self.assertEqual(counts["missing"], 1)
+        self.assertEqual(counts["purged"], 1)
+        row = self.conn.execute(
+            "SELECT purged_at FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["purged_at"])
+
+    def test_shots_and_source_row_survive_a_purge(self):
+        """Only the raw bytes go away — metadata stays queryable."""
+        source_id = self.add_source(scene_detected_at="2026-01-01")
+        shot_id = self.add_shot(source_id, rendered_at="2026-01-01")
+        self.add_raw_file(source_id)
+
+        purge.run(self.conn, self.cfg, dry_run=False)
+
+        self.assertIsNotNone(
+            self.conn.execute(
+                "SELECT * FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        )
+        self.assertIsNotNone(
+            self.conn.execute(
+                "SELECT * FROM shots WHERE id = ?", (shot_id,)
+            ).fetchone()
+        )

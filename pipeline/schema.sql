@@ -41,7 +41,16 @@ CREATE TABLE IF NOT EXISTS sources (
 
     scene_detected_at TEXT,                      -- NULL = stage 1b still owes this file
     ingested_at       TEXT    NOT NULL DEFAULT (datetime('now')),
-    notes             TEXT
+    notes             TEXT,
+
+    -- Local disk is not the only copy: every source is already backed up to
+    -- cloud storage outside this pipeline. Once every shot cut from a file has
+    -- either rendered (the render is the copy that actually gets posted or
+    -- sold) or been rejected, the local raw file is just occupying space, so
+    -- `purge` deletes it and stamps this. Nothing in the `shots` rows is
+    -- touched — the archive's metadata stays queryable after the bytes are
+    -- gone, and the cloud copy is what a re-render would come from.
+    purged_at         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sources_country ON sources(country);
@@ -94,6 +103,10 @@ CREATE TABLE IF NOT EXISTS shots (
     subject_tags      TEXT,                      -- JSON array: village, coastline, ruins...
     mood_tags         TEXT,                      -- JSON array: solitude, vastness...
     person_in_frame   INTEGER,                   -- 0/1, drives the periodic you-in-frame clip
+    subject_offset_x  REAL,                      -- 0..1 horizontal position of a tracked
+                                                   -- car/person, averaged across the shot;
+                                                   -- NULL when there's nothing to track,
+                                                   -- which keeps the reel crop centred
     description       TEXT,                      -- draft one-liner, doubles as stock caption
     inferred_site     TEXT,                      -- specific location when folders don't say
     tagged_at         TEXT,
@@ -107,6 +120,12 @@ CREATE TABLE IF NOT EXISTS shots (
     approved_at       TEXT,
     social_render_path    TEXT,                  -- 9:16, overlay burned in, compressed
     licensing_render_path TEXT,                  -- clean 16:9 master, no overlay
+    -- Set by `upload`, ahead of the actual post: the render's URL once it's
+    -- hosted on Zernio's storage. Lets `publish` run somewhere that only has
+    -- the database and no access to the render file itself — a scheduled
+    -- runner with no ffmpeg, no archive, nothing but the API key.
+    social_media_url      TEXT,
+    media_uploaded_at     TEXT,
     overlay_text      TEXT,                      -- resolved "year · location" line
     license_tier      TEXT,                      -- public | non-exclusive | exclusive
     rendered_at       TEXT,
@@ -114,6 +133,11 @@ CREATE TABLE IF NOT EXISTS shots (
     -- ---------------------------------------------------------------------
     -- Stage 5 — distribute & learn
     -- ---------------------------------------------------------------------
+    -- NULL = post as soon as `publish` next runs. Set by `schedule` to hold a
+    -- rendered shot for a future run instead — `publish` skips anything whose
+    -- time hasn't come. This is a pipeline-side queue, not a Zernio feature:
+    -- the post is only sent to Zernio (as publishNow) once its slot arrives.
+    scheduled_at      TEXT,
     caption           TEXT,
     zernio_post_id    TEXT,                      -- the `post._id` Zernio returns
     platform_ids      TEXT,                      -- JSON object: {platform: account_id}

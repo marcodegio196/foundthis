@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -29,6 +30,18 @@ log = logging.getLogger(__name__)
 
 # Vertical renders suit reels and TikTok; Facebook is left out unless asked for.
 DEFAULT_PLATFORMS = ("instagram", "tiktok")
+
+# Same shape as db.now() — naive text, UTC implied — so scheduled_at compares
+# correctly against it with plain string ordering.
+_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _format_ts(when: datetime) -> str:
+    return when.strftime(_TS_FORMAT)
+
+
+def _parse_ts(text: str) -> datetime:
+    return datetime.strptime(text, _TS_FORMAT).replace(tzinfo=timezone.utc)
 
 
 # Instagram shows roughly the first 125 characters and hides the rest behind
@@ -64,7 +77,20 @@ class PublishClient(Protocol):
     def publish(
         self, video_path: Path, caption: str, *, platforms: Sequence[str] | None = None
     ) -> dict[str, Any]:
-        """Publish a clip; return the Zernio response."""
+        """Upload a render and publish it now; return the Zernio response."""
+
+    def upload_media(self, video_path: Path) -> str:
+        """Upload a render, return its hosted URL, without posting."""
+
+    def publish_url(
+        self,
+        media_url: str,
+        caption: str,
+        *,
+        media_type: str = "video",
+        platforms: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Publish media that's already hosted — no local file needed."""
 
     def fetch_post(self, post_id: str) -> dict[str, Any] | None:
         """Fetch a published post's current state."""
@@ -74,12 +100,21 @@ class DryRunClient:
     """Records what would be published. The default until an API key is set."""
 
     def __init__(self) -> None:
-        self.published: list[tuple[Path, str]] = []
+        self.published: list[tuple[str, str]] = []
+        self.uploaded: list[Path] = []
+
+    def upload_media(self, video_path):
+        self.uploaded.append(Path(video_path))
+        log.info("[dry run] would upload %s", video_path)
+        return f"dry-run://{Path(video_path).name}"
+
+    def publish_url(self, media_url, caption, *, media_type="video", platforms=None):
+        self.published.append((media_url, caption))
+        log.info("[dry run] would publish %s to %s", media_url, platforms or "all")
+        return {}
 
     def publish(self, video_path, caption, *, platforms=None):
-        self.published.append((Path(video_path), caption))
-        log.info("[dry run] would publish %s to %s", video_path, platforms or "all")
-        return {}
+        return self.publish_url(self.upload_media(video_path), caption, platforms=platforms)
 
     def fetch_post(self, post_id: str):
         return None
@@ -93,6 +128,100 @@ def build_client(cfg: Config = default_config) -> PublishClient:
         return DryRunClient()
 
 
+def schedule_pending(
+    conn: sqlite3.Connection,
+    cfg: Config = default_config,
+    *,
+    count: int | None = None,
+    interval_hours: float | None = None,
+    start_at: datetime | None = None,
+) -> list[tuple[db.Row, datetime]]:
+    """Give rendered, un-posted, un-scheduled shots a future posting time.
+
+    This is a queue inside the pipeline, not a Zernio feature — `publish`
+    still sends each post as `publishNow` once its slot arrives (see
+    `publish_pending`). That keeps a blocked or skipped run harmless: nothing
+    posts early, and nothing is lost, because a shot just waits at
+    `posted_at IS NULL` until a `publish` run actually reaches its time.
+
+    Slots are spaced `interval_hours` apart, starting after whatever is
+    already scheduled — so calling this again to add more shots extends the
+    queue instead of double-booking an existing slot. Only touches shots with
+    no `scheduled_at` yet; to change an existing slot, clear it first.
+    """
+    interval = interval_hours if interval_hours is not None else cfg.post_interval_hours
+    rows = conn.execute(
+        "SELECT * FROM shot_details WHERE selection_state = 'approved' "
+        "AND rendered_at IS NOT NULL AND posted_at IS NULL AND scheduled_at IS NULL "
+        "ORDER BY approved_at"
+        + (f" LIMIT {int(count)}" if count else "")
+    ).fetchall()
+    if not rows:
+        return []
+
+    if start_at is not None:
+        next_slot = start_at
+    else:
+        latest = conn.execute(
+            "SELECT MAX(scheduled_at) FROM shots "
+            "WHERE scheduled_at IS NOT NULL AND posted_at IS NULL"
+        ).fetchone()[0]
+        next_slot = (
+            _parse_ts(latest) + timedelta(hours=interval)
+            if latest
+            else datetime.now(timezone.utc)
+        )
+
+    scheduled: list[tuple[db.Row, datetime]] = []
+    with db.transaction(conn):
+        for row in rows:
+            db.update_shot(conn, row["id"], scheduled_at=_format_ts(next_slot))
+            scheduled.append((row, next_slot))
+            next_slot = next_slot + timedelta(hours=interval)
+    return scheduled
+
+
+def upload_pending(
+    conn: sqlite3.Connection,
+    cfg: Config = default_config,
+    *,
+    limit: int | None = None,
+    client: PublishClient | None = None,
+) -> dict[str, int]:
+    """Host every rendered, un-uploaded render on Zernio, ahead of posting it.
+
+    This is the step that needs the actual file and a real network upload —
+    meant to run wherever the render lives (next to the archive, with
+    ffmpeg). Once `social_media_url` is set, `publish_pending` never touches
+    the file again, so a runner with only the database (a cloud publish job,
+    say) can still post it.
+    """
+    client = client if client is not None else build_client(cfg)
+    rows = conn.execute(
+        "SELECT * FROM shot_details WHERE social_render_path IS NOT NULL "
+        "AND social_media_url IS NULL AND posted_at IS NULL "
+        "ORDER BY rendered_at"
+        + (f" LIMIT {int(limit)}" if limit else "")
+    ).fetchall()
+
+    counts = {"uploaded": 0, "failed": 0}
+    for row in rows:
+        try:
+            media_url = client.upload_media(Path(row["social_render_path"]))
+        except Exception as exc:
+            log.warning("upload failed for shot %s: %s", row["id"], exc)
+            counts["failed"] += 1
+            continue
+        with db.transaction(conn):
+            db.update_shot(
+                conn, row["id"], social_media_url=media_url, media_uploaded_at=db.now()
+            )
+        counts["uploaded"] += 1
+        log.info("shot %s uploaded to %s", row["id"], media_url)
+
+    return counts
+
+
 def publish_pending(
     conn: sqlite3.Connection,
     cfg: Config = default_config,
@@ -101,22 +230,38 @@ def publish_pending(
     platforms: Sequence[str] = DEFAULT_PLATFORMS,
     client: PublishClient | None = None,
 ) -> dict[str, int]:
-    """Post every rendered, approved, un-posted shot."""
+    """Post every rendered, approved, un-posted shot whose time has come.
+
+    A shot with no `scheduled_at` posts as soon as this runs, same as before
+    scheduling existed — `schedule` is opt-in per shot, not a mode switch.
+
+    A shot already uploaded (see `upload_pending`) posts from its stored URL
+    and never touches `social_render_path` — the only case that needs the
+    file on disk is one nobody uploaded ahead of time, which is the normal
+    local flow (render then publish in the same run).
+    """
     client = client if client is not None else build_client(cfg)
     rows = conn.execute(
         "SELECT * FROM shot_details WHERE selection_state = 'approved' "
         "AND social_render_path IS NOT NULL AND posted_at IS NULL "
+        "AND (scheduled_at IS NULL OR scheduled_at <= ?) "
         "ORDER BY approved_at"
-        + (f" LIMIT {int(limit)}" if limit else "")
+        + (f" LIMIT {int(limit)}" if limit else ""),
+        (db.now(),),
     ).fetchall()
 
     counts = {"posted": 0, "failed": 0}
     for row in rows:
         caption = build_caption(row, cfg)
         try:
-            response = client.publish(
-                Path(row["social_render_path"]), caption, platforms=platforms
-            )
+            if row["social_media_url"]:
+                response = client.publish_url(
+                    row["social_media_url"], caption, platforms=platforms
+                )
+            else:
+                response = client.publish(
+                    Path(row["social_render_path"]), caption, platforms=platforms
+                )
         except Exception as exc:
             log.warning("publish failed for shot %s: %s", row["id"], exc)
             counts["failed"] += 1

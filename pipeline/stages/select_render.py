@@ -32,9 +32,23 @@ PERSON_EVERY = 8
 
 
 def _recent(conn: sqlite3.Connection, limit: int) -> list[db.Row]:
+    """The last `limit` slots in the feed timeline, posted or not.
+
+    An approved shot that hasn't posted yet still holds a place in the feed —
+    it's just ahead of now instead of behind it — so it has to count toward
+    the cooldown too. Without this, auto-approving repeatedly (one call per
+    day, say) only ever sees *posted* history: two calls made before the
+    first one's shot has actually gone out can't see each other and happily
+    pick the same country twice in a row. Ordered by whichever timestamp the
+    shot actually has — posted, then scheduled, then approved — so a shot
+    still waiting to be scheduled counts too.
+    """
     return conn.execute(
-        "SELECT * FROM shot_details WHERE posted_at IS NOT NULL "
-        "ORDER BY posted_at DESC LIMIT ?",
+        "SELECT * FROM shot_details WHERE rejected = 0 AND ("
+        "  posted_at IS NOT NULL"
+        "  OR (selection_state = 'approved' AND posted_at IS NULL)"
+        ") "
+        "ORDER BY COALESCE(posted_at, scheduled_at, approved_at) DESC LIMIT ?",
         (limit,),
     ).fetchall()
 
@@ -43,6 +57,7 @@ def propose_queue(
     conn: sqlite3.Connection,
     count: int = 10,
     *,
+    cfg: Config = default_config,
     rng: random.Random | None = None,
 ) -> list[tuple[db.Row, str]]:
     """Pick the next shots to review, with the reason each was chosen.
@@ -62,7 +77,7 @@ def propose_queue(
     says which tier it came from, so a feed that has quietly stopped varying is
     visible rather than silent.
     """
-    rng = rng or random.Random(default_config.selection_seed)
+    rng = rng or random.Random(cfg.selection_seed)
 
     recent = _recent(conn, max(COUNTRY_COOLDOWN, YEAR_COOLDOWN, MOOD_COOLDOWN))
     recent_countries = {r["country"] for r in recent[:COUNTRY_COOLDOWN] if r["country"]}
@@ -76,7 +91,7 @@ def propose_queue(
     ).fetchone()[0]
     want_person = posted > 0 and posted % PERSON_EVERY == 0
 
-    candidates = list(db.selection_queue(conn))
+    candidates = list(db.selection_queue(conn, min_seconds=cfg.min_render_seconds))
     rng.shuffle(candidates)
 
     # `person_in_frame` is only known if the tagging pass ran. Without it the
@@ -144,6 +159,35 @@ def stage_queue(conn: sqlite3.Connection, count: int = 10) -> list[db.Row]:
     return [row for row, _ in proposed]
 
 
+def auto_approve(
+    conn: sqlite3.Connection,
+    count: int = 1,
+    *,
+    cfg: Config = default_config,
+    rng: random.Random | None = None,
+) -> list[tuple[db.Row, str]]:
+    """Approve what the diversity rules propose, with nobody in the loop.
+
+    Stage 4 was built with a human between the proposal and the render, because
+    the format had not been validated yet. The rules that pick a shot have not
+    changed; this deletes the wait, which is what the stage was always designed
+    to allow.
+
+    What it does not delete is the reason attached to each pick. A feed running
+    unattended still has to be auditable after the fact — `queue` shows the same
+    proposals without approving them, and the reason recorded here says which
+    diversity tier the shot came from, so a feed that has quietly stopped
+    varying can be seen in the log rather than only on the profile.
+    """
+    proposed = propose_queue(conn, count, cfg=cfg, rng=rng)
+    if not proposed:
+        return []
+    approve(conn, [row["id"] for row, _ in proposed])
+    for row, reason in proposed:
+        log.info("auto-approved shot %s (%s)", row["id"], reason)
+    return proposed
+
+
 def approve(conn: sqlite3.Connection, shot_ids: list[int]) -> int:
     with db.transaction(conn):
         for shot_id in shot_ids:
@@ -188,6 +232,7 @@ def measure_backdrop(
                 out_point=out_point,
                 width=row["source_width"] or 0,
                 height=row["source_height"] or 0,
+                offset_x=row["subject_offset_x"],
             )
         )
     except media.MediaError as exc:
@@ -233,6 +278,7 @@ def render_shot(
                 font_file=cfg.overlay_font,
                 font_color=font_color,
                 shadow_color=shadow_color,
+                offset_x=row["subject_offset_x"],
             ),
             capture=True,
         )

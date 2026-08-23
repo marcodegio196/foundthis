@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 # Bumped when schema.sql changes in a way that needs a migration step.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 8
 
 # Columns stored as JSON text. Read helpers decode them; write helpers encode.
 JSON_COLUMNS = frozenset(
@@ -43,6 +43,19 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE shots ADD COLUMN speed_reversals INTEGER",
         "ALTER TABLE shots ADD COLUMN speed_spread REAL",
         "ALTER TABLE shots ADD COLUMN is_window INTEGER NOT NULL DEFAULT 1",
+    ),
+    5: (
+        "ALTER TABLE shots ADD COLUMN subject_offset_x REAL",
+    ),
+    6: (
+        "ALTER TABLE sources ADD COLUMN purged_at TEXT",
+    ),
+    7: (
+        "ALTER TABLE shots ADD COLUMN scheduled_at TEXT",
+    ),
+    8: (
+        "ALTER TABLE shots ADD COLUMN social_media_url TEXT",
+        "ALTER TABLE shots ADD COLUMN media_uploaded_at TEXT",
     ),
 }
 
@@ -235,6 +248,17 @@ def update_shot(conn: sqlite3.Connection, shot_id: int, **values: Any) -> None:
     )
 
 
+def update_source(conn: sqlite3.Connection, source_id: int, **values: Any) -> None:
+    """Patch a source row. Only the named columns are touched."""
+    if not values:
+        return
+    assignments = ", ".join(f"{c} = :{c}" for c in values)
+    conn.execute(
+        f"UPDATE sources SET {assignments} WHERE id = :source_id",
+        {**_encode(values), "source_id": source_id},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reads — one query per stage, so runners stay thin
 # ---------------------------------------------------------------------------
@@ -263,7 +287,12 @@ def shots_pending_tagging(conn: sqlite3.Connection, limit: int | None = None) ->
     ).fetchall()
 
 
-def selection_queue(conn: sqlite3.Connection, limit: int | None = None) -> list[Row]:
+def selection_queue(
+    conn: sqlite3.Connection,
+    limit: int | None = None,
+    *,
+    min_seconds: float = 0.0,
+) -> list[Row]:
     """Un-posted survivors awaiting a stage 4 decision.
 
     Tagging is optional. Country comes from the folder a file sits in and the
@@ -273,13 +302,20 @@ def selection_queue(conn: sqlite3.Connection, limit: int | None = None) -> list[
 
     Ordering is only a stable starting point — stage 4 shuffles this, because
     ranking by score walks a large archive best-country-first.
+
+    `min_seconds` keeps shots that cannot reach a render out of the queue
+    entirely. Proposing one wastes a slot under the diversity rules and, once
+    approval is automatic, produces an approved shot that the render step then
+    refuses — a queue that quietly disagrees with itself.
     """
     return conn.execute(
         "SELECT * FROM shot_details "
         "WHERE rejected = 0 AND posted_at IS NULL "
         "AND selection_state IN ('unreviewed', 'queued') "
+        "AND duration >= ? "
         "ORDER BY selection_state DESC, aesthetic_score DESC"
-        + (f" LIMIT {int(limit)}" if limit else "")
+        + (f" LIMIT {int(limit)}" if limit else ""),
+        (min_seconds,),
     ).fetchall()
 
 
@@ -318,5 +354,8 @@ def stats(conn: sqlite3.Connection) -> dict[str, int]:
             "SELECT count(*) FROM shots WHERE selection_state = 'approved'"
         ),
         "rendered": scalar("SELECT count(*) FROM shots WHERE rendered_at IS NOT NULL"),
+        "scheduled": scalar(
+            "SELECT count(*) FROM shots WHERE scheduled_at IS NOT NULL AND posted_at IS NULL"
+        ),
         "posted": scalar("SELECT count(*) FROM shots WHERE posted_at IS NOT NULL"),
     }

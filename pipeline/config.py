@@ -117,6 +117,9 @@ class Config:
     social_platforms: tuple[str, ...] = tuple(
         p.strip() for p in os.environ.get("SOCIAL_PLATFORMS", "instagram,tiktok").split(",") if p.strip()
     )
+    # Default spacing between scheduled posts. `schedule` uses this when no
+    # --interval-hours is given on the CLI.
+    post_interval_hours: float = _float("POST_INTERVAL_HOURS", 24.0)
 
     # Stage 4 outputs and stage 6 exports all stay on local disk. Nothing in the
     # pipeline ever deletes or moves a file under archive_root.

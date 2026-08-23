@@ -146,6 +146,28 @@ class TestCrop(unittest.TestCase):
                 self.assertLessEqual(crop_w, width)
                 self.assertLessEqual(crop_h, height)
 
+    def test_offset_shifts_the_crop_toward_the_tracked_subject(self):
+        # A subject at the right edge (offset_x=1) should pull the crop window
+        # as far right as it can go without running past the source.
+        crop = render.crop_to_vertical(1920, 1080, offset_x=1.0)
+        crop_w, crop_h, x, y = (int(d) for d in crop.split("=")[1].split(":"))
+        self.assertEqual((crop_w, crop_h, y), (608, 1080, 0))
+        self.assertEqual(x, 1920 - crop_w)
+
+    def test_offset_at_centre_matches_the_centred_crop(self):
+        self.assertEqual(
+            render.crop_to_vertical(1920, 1080, offset_x=None),
+            render.crop_to_vertical(1920, 1080),
+        )
+
+    def test_offset_does_not_shift_the_vertical_trim_case(self):
+        # Taller-than-vertical sources trim top/bottom; offset_x is a horizontal
+        # signal only and has nothing to act on there.
+        self.assertEqual(
+            render.crop_to_vertical(1080, 2400, offset_x=0.0),
+            render.crop_to_vertical(1080, 2400),
+        )
+
 
 class TestVerticalOutputSize(unittest.TestCase):
     def test_standard_size(self):
