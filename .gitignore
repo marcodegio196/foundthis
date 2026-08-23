@@ -9,7 +9,7 @@ venv/
 *.pem
 
 # Pipeline state — the DB is derived data, rebuildable from the archive
-*.db
+*.db`n!pipeline.db
 *.db-wal
 *.db-shm
 
